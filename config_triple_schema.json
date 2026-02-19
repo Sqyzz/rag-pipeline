@@ -1,0 +1,115 @@
+{
+  "entity_types": [
+    "person",
+    "org_unit",
+    "organization",
+    "project",
+    "system",
+    "document",
+    "policy",
+    "issue",
+    "risk",
+    "metric",
+    "event",
+    "meeting",
+    "location"
+  ],
+  "relations": [
+    {
+      "name": "reports_to",
+      "subject_types": ["person", "org_unit"],
+      "object_types": ["person", "org_unit"],
+      "aliases": ["reports to", "reporting to", "managed by"]
+    },
+    {
+      "name": "works_on",
+      "subject_types": ["person", "org_unit"],
+      "object_types": ["project", "system"],
+      "aliases": ["works on", "contributes to", "develops"]
+    },
+    {
+      "name": "owns",
+      "subject_types": ["org_unit", "organization"],
+      "object_types": ["system", "project", "policy"],
+      "aliases": ["owns", "responsible for", "in charge of"]
+    },
+    {
+      "name": "responsible_for",
+      "subject_types": ["person", "org_unit"],
+      "object_types": ["project", "system", "issue", "risk"],
+      "aliases": ["responsible for", "accountable for", "leads"]
+    },
+    {
+      "name": "part_of",
+      "subject_types": ["org_unit", "project", "system"],
+      "object_types": ["organization", "project", "system"],
+      "aliases": ["part of", "belongs to", "subsystem of"]
+    },
+    {
+      "name": "depends_on",
+      "subject_types": ["project", "system"],
+      "object_types": ["project", "system"],
+      "aliases": ["depends on", "requires", "blocked by"]
+    },
+    {
+      "name": "produces",
+      "subject_types": ["project", "person", "org_unit"],
+      "object_types": ["document", "policy", "metric"],
+      "aliases": ["produces", "creates", "generates"]
+    },
+    {
+      "name": "authored_by",
+      "subject_types": ["document", "policy"],
+      "object_types": ["person", "org_unit"],
+      "aliases": ["authored by", "written by", "created by"]
+    },
+    {
+      "name": "approved_by",
+      "subject_types": ["document", "policy", "project"],
+      "object_types": ["person", "org_unit"],
+      "aliases": ["approved by", "signed off by", "authorized by"]
+    },
+    {
+      "name": "addresses",
+      "subject_types": ["project", "policy", "system"],
+      "object_types": ["issue", "risk"],
+      "aliases": ["addresses", "mitigates", "reduces"]
+    },
+    {
+      "name": "causes",
+      "subject_types": ["issue", "risk", "event"],
+      "object_types": ["issue", "risk", "event"],
+      "aliases": ["causes", "leads to", "triggers"]
+    },
+    {
+      "name": "measured_by",
+      "subject_types": ["project", "system", "policy"],
+      "object_types": ["metric"],
+      "aliases": ["measured by", "tracked by", "evaluated by"]
+    },
+    {
+      "name": "discussed_in",
+      "subject_types": ["issue", "risk", "project", "policy"],
+      "object_types": ["meeting", "document"],
+      "aliases": ["discussed in", "reviewed in", "raised in"]
+    },
+    {
+      "name": "decided_in",
+      "subject_types": ["policy", "project", "issue"],
+      "object_types": ["meeting", "event"],
+      "aliases": ["decided in", "agreed in", "resolved in"]
+    },
+    {
+      "name": "scheduled_at",
+      "subject_types": ["meeting", "event"],
+      "object_types": ["location"],
+      "aliases": ["scheduled at", "held at", "takes place at"]
+    },
+    {
+      "name": "located_in",
+      "subject_types": ["person", "org_unit", "organization"],
+      "object_types": ["location"],
+      "aliases": ["based in", "located in"]
+    }
+  ]
+}

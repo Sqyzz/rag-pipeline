@@ -1,0 +1,20 @@
+pyyaml
+tqdm
+pandas
+numpy
+
+llama-index
+llama-index-embeddings-huggingface
+sentence-transformers
+
+faiss-cpu
+# 如果你想用chroma也行：chromadb
+
+requests
+python-dotenv
+openai
+python-igraph
+leidenalg
+
+# 可选：本地推理
+vllm

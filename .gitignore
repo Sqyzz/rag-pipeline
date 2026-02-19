@@ -1,0 +1,20 @@
+.env
+
+# Local virtual environments
+.venv/
+venv/
+
+# Cache and Python bytecode directories
+.cache/
+__pycache__/
+
+# Local generated artifacts
+outputs/
+data/
+
+# Embedded external/local project
+youtu-graphrag/
+
+# Editor and OS directories
+.vscode/
+.idea/

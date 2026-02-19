@@ -1,0 +1,71 @@
+llm:
+  backend: api      # "local" or "api"
+  local:
+    base_url: http://REMOTE_GPT_SERVER:8000/v1
+    model: Qwen2.5-7B-Instruct
+    api_key: EMPTY
+  api:
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    model: qwen-flash
+    api_key_env: LLM_API_KEY
+
+embedding:
+  backend: api      # "local" or "api"
+  local:
+    model: sentence-transformers/all-MiniLM-L6-v2
+  api:
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1/
+    model: text-embedding-v4
+    api_key_env: EMB_API_KEY
+
+chunking:
+  chunk_size: 1600
+  overlap: 200
+
+
+retrieval:
+  top_k: 8
+
+comparison:
+  best_effort:
+    vector_top_k: 8
+    vector_max_context_chars: 12000
+    kg:
+      max_hops: 2
+      max_start_entities: 5
+      top_edges: 60
+      max_chunks: 12
+      max_context_chars: 12000
+    graph:
+      top_communities: 3
+      max_evidence: 12
+      query_level: -1
+      use_hierarchy: true
+      use_community_summaries: true
+      shuffle_communities: true
+      use_map_reduce: true
+      max_summary_chars: 1800
+
+  budget_matched:
+    vector_top_k: 3
+    vector_max_context_chars: 3600
+    kg:
+      max_hops: 1
+      max_start_entities: 3
+      top_edges: 24
+      max_chunks: 6
+      max_context_chars: 3600
+    graph:
+      top_communities: 1
+      max_evidence: 6
+      query_level: 0
+      use_hierarchy: true
+      use_community_summaries: true
+      shuffle_communities: false
+      use_map_reduce: true
+      max_summary_chars: 1200
+    budget:
+      max_prompt_tokens: 3000
+      max_completion_tokens: 800
+      max_total_tokens: 3800
+      max_llm_calls: 2
