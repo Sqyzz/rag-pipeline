@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -349,6 +350,7 @@ def run_compare(
     regimes: str,
     budget_config_file: str,
 ) -> dict:
+    os.environ["GRAPH_RAG_CHUNKS_FILE"] = str(chunks_file)
     _progress(f"loading queries: {queries_file}")
     queries = _load_queries(queries_file)
     _progress(f"loaded queries: {len(queries)}")
@@ -436,11 +438,20 @@ def run_compare(
                 **kg_kwargs,
             )
             _progress(f"query {idx}/{len(queries)} regime={rg}: graph_rag")
+            graph_budget_kwargs = {}
+            if is_budget:
+                graph_budget_kwargs = {
+                    "max_llm_calls": int(budget["max_llm_calls"]),
+                    "max_total_tokens": int(budget["max_total_tokens"]),
+                    "evidence_token_limit": int(budget["evidence_token_limit"]),
+                    "strict_budget": True,
+                }
             graph_out = answer_with_graphrag(
                 query=query,
                 graph_file=graph_file,
                 communities_file=communities_file,
                 max_completion_tokens=budget["max_completion_tokens"] if is_budget else None,
+                **graph_budget_kwargs,
                 **graph_kwargs,
             )
 
@@ -468,6 +479,7 @@ def run_compare(
                     graph_file=graph_file,
                     communities_file=communities_file,
                     max_completion_tokens=budget["max_completion_tokens"],
+                    **graph_budget_kwargs,
                     **tighter_graph_kwargs,
                 )
                 graph_out["budget_adaptation"] = {

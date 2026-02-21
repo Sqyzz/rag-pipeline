@@ -26,6 +26,21 @@ chunking:
 retrieval:
   top_k: 8
 
+graph:
+  youtu:
+    base_url: "http://127.0.0.1:8080"
+    dataset: "enterprise"
+    timeout_sec: 120
+    search_timeout_sec: 900
+    search_max_retries: 2
+    search_retry_backoff_sec: 3
+    construct_poll_sec: 2
+    construct_timeout_sec: 1800
+    require_id_alignment: true
+    chunks_file: "data/processed/chunks_sampled.jsonl"
+    graph_dir: "youtu-graphrag/output/graphs"
+    sync_state_file: "outputs/cache/youtu_sync_state.json"
+
 comparison:
   best_effort:
     vector_top_k: 8
