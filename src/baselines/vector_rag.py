@@ -152,5 +152,6 @@ Answer the question using only the following contexts:
 
 Question:
 {query}
+Just answer the question briefly. No explanation is needed if not necessary.
 """
     return llm.chat(prompt, max_tokens=max_completion_tokens, return_meta=return_meta)

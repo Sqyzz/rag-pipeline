@@ -69,3 +69,12 @@ comparison:
       max_completion_tokens: 800
       max_total_tokens: 3800
       max_llm_calls: 2
+
+youtu:
+  base_url: http://127.0.0.1:8080
+  dataset: enterprise
+  timeout_sec: 120
+  construct_poll_sec: 2
+  construct_timeout_sec: 1800
+  max_retries: 2
+  retry_sleep_sec: 1.0

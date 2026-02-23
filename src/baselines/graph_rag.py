@@ -217,6 +217,7 @@ Query:
 
 Partial answers:
 {partials}
+Just answer the question briefly. No explanation is needed if not necessary.
 """
     return llm_chat(
         [{"role": "user", "content": prompt}],
@@ -254,6 +255,7 @@ Query:
 
 Evidence:
 {evidence}
+Just answer the question briefly. No explanation is needed if not necessary.
 """
     return llm_chat(
         [{"role": "user", "content": prompt}],

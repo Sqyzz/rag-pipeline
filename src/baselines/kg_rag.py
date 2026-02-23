@@ -361,6 +361,7 @@ Subgraph edges (from {max_hops}-hop traversal):
 
 Retrieved chunk contexts:
 {context_block}
+Just answer the question briefly. No explanation is needed if not necessary.
 """
     answer, answer_meta = llm_chat(
         [{"role": "user", "content": prompt}],
