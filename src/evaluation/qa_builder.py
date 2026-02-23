@@ -31,6 +31,19 @@ def _read_chunk_store(path: str) -> list[dict]:
     return rows
 
 
+def _read_jsonl(path: str) -> list[dict]:
+    p = Path(path)
+    if not p.exists():
+        return []
+    rows: list[dict] = []
+    with p.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
 def _write_jsonl(path: str, rows: list[dict]) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -174,6 +187,7 @@ def build_qa(
     n_trace: int,
     qa_community_level: int,
     seed: int,
+    append: bool = False,
 ) -> dict:
     rng = random.Random(seed)
     graph = _load_json(graph_file)
@@ -203,22 +217,44 @@ def build_qa(
         reverse=True,
     )
 
-    rows: list[dict] = []
-    used_queries = set()
-    qnum = 1
+    existing_rows: list[dict] = _read_jsonl(out_gold) if append else []
+    rows: list[dict] = list(existing_rows)
+    new_rows: list[dict] = []
+    used_queries = {str(r.get("query", "")).strip().lower() for r in rows if str(r.get("query", "")).strip()}
+    used_qids = {str(r.get("qid", "")).strip() for r in rows if str(r.get("qid", "")).strip()}
+    qnums = []
+    for qid in used_qids:
+        m = re.match(r"^q(\d+)$", qid, re.IGNORECASE)
+        if m:
+            qnums.append(int(m.group(1)))
+    qnum = (max(qnums) + 1) if qnums else 1
+    produced_new = {
+        "local_factual": 0,
+        "cross_doc_reasoning": 0,
+        "global_summary": 0,
+        "evidence_tracing": 0,
+    }
 
     def next_qid() -> str:
         nonlocal qnum
-        qid = f"q{qnum:03d}"
-        qnum += 1
-        return qid
+        while True:
+            qid = f"q{qnum:03d}"
+            qnum += 1
+            if qid not in used_qids:
+                used_qids.add(qid)
+                return qid
 
-    def add_row(row: dict) -> None:
+    def add_row(row: dict) -> bool:
         q = row["query"].strip().lower()
         if not q or q in used_queries:
-            return
+            return False
         used_queries.add(q)
         rows.append(row)
+        new_rows.append(row)
+        t = str(row.get("type", ""))
+        if t in produced_new:
+            produced_new[t] += 1
+        return True
 
     # local_factual
     local_templates = [
@@ -227,7 +263,7 @@ def build_qa(
         "What is the object of relation '{r}' for {a}?",
     ]
     for e in edges_ranked:
-        if len([x for x in rows if x["type"] == "local_factual"]) >= n_local:
+        if produced_new["local_factual"] >= n_local:
             break
         a = str(e.get("source", "")).strip()
         r = str(e.get("relation", "")).strip()
@@ -276,7 +312,7 @@ def build_qa(
     ]
     cross_count = 0
     for mid, e1, e2, a, c in path_candidates:
-        if cross_count >= n_cross:
+        if cross_count >= n_cross or produced_new["cross_doc_reasoning"] >= n_cross:
             break
         chunks = _pick_edge_chunks(e1, chunk_map, k=2) + _pick_edge_chunks(e2, chunk_map, k=2)
         # unique chunk refs
@@ -309,7 +345,8 @@ def build_qa(
                 "supporting_communities": communities_ref,
             }
         )
-        cross_count += 1
+        if produced_new["cross_doc_reasoning"] > cross_count:
+            cross_count += 1
 
     # global_summary
     global_templates = [
@@ -320,6 +357,8 @@ def build_qa(
     summary_candidates = [c for c in level_communities if str(c.get("summary", "")).strip()]
     summary_candidates.sort(key=lambda x: int(x.get("size", 0)), reverse=True)
     for i, c in enumerate(summary_candidates[:n_global]):
+        if produced_new["global_summary"] >= n_global:
+            break
         cid = str(c.get("community_id"))
         summary = str(c.get("summary", "")).strip()
         edge_refs = []
@@ -351,7 +390,7 @@ def build_qa(
     # evidence_tracing
     trace_count = 0
     for e in edges_ranked:
-        if trace_count >= n_trace:
+        if trace_count >= n_trace or produced_new["evidence_tracing"] >= n_trace:
             break
         base_chunks = _pick_edge_chunks(e, chunk_map, k=6)
         if len(base_chunks) < 3:
@@ -386,9 +425,10 @@ def build_qa(
                 "supporting_communities": communities_ref,
             }
         )
-        trace_count += 1
+        if produced_new["evidence_tracing"] > trace_count:
+            trace_count += 1
 
-    _validate_gold(rows, chunk_map, edge_by_id, community_by_id)
+    _validate_gold(new_rows, chunk_map, edge_by_id, community_by_id)
 
     queries_rows = [{"qid": r["qid"], "type": r["type"], "query": r["query"]} for r in rows]
     gold_answer_rows = [{"qid": r["qid"], "answer": r["answer"]} for r in rows]
@@ -409,7 +449,7 @@ def build_qa(
     }
     warnings = []
     for t, n in requested.items():
-        produced = int(by_type.get(t, 0))
+        produced = int(produced_new.get(t, 0))
         if produced < n:
             warnings.append(f"type={t}: requested={n}, produced={produced}")
     coverage = round(matched_mentions / max(total_mentions, 1), 4)
@@ -423,7 +463,10 @@ def build_qa(
         "out_queries": out_queries,
         "out_gold_answer": out_gold_answer,
         "num_rows": len(rows),
+        "num_existing_rows": len(existing_rows),
+        "num_added_rows": len(new_rows),
         "by_type": by_type,
+        "added_by_type": produced_new,
         "requested_by_type": requested,
         "graph_chunk_mention_coverage": {
             "matched_mentions": matched_mentions,
@@ -433,6 +476,7 @@ def build_qa(
         "warnings": warnings,
         "qa_community_level": level,
         "seed": seed,
+        "append": append,
     }
 
 
@@ -450,7 +494,35 @@ def main() -> None:
     parser.add_argument("--n_trace", type=int, default=10)
     parser.add_argument("--qa-community-level", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--append", action="store_true", help="Append new QA rows to existing outputs")
+    parser.add_argument(
+        "--append-type",
+        choices=["local_factual", "cross_doc_reasoning", "global_summary", "evidence_tracing"],
+        default=None,
+        help="Generate only this QA type (use with --append-count)",
+    )
+    parser.add_argument("--append-count", type=int, default=None, help="How many rows to generate for --append-type")
     args = parser.parse_args()
+
+    if args.append_count is not None and args.append_count < 0:
+        parser.error("--append-count must be >= 0")
+    if (args.append_type is None) != (args.append_count is None):
+        parser.error("--append-type and --append-count must be used together")
+
+    n_local = args.n_local
+    n_cross = args.n_cross
+    n_global = args.n_global
+    n_trace = args.n_trace
+    if args.append_type is not None:
+        n_local, n_cross, n_global, n_trace = 0, 0, 0, 0
+        if args.append_type == "local_factual":
+            n_local = int(args.append_count)
+        elif args.append_type == "cross_doc_reasoning":
+            n_cross = int(args.append_count)
+        elif args.append_type == "global_summary":
+            n_global = int(args.append_count)
+        elif args.append_type == "evidence_tracing":
+            n_trace = int(args.append_count)
 
     summary = build_qa(
         graph_file=args.graph_file,
@@ -459,12 +531,13 @@ def main() -> None:
         out_gold=args.out_gold,
         out_queries=args.out_queries,
         out_gold_answer=args.out_gold_answer,
-        n_local=args.n_local,
-        n_cross=args.n_cross,
-        n_global=args.n_global,
-        n_trace=args.n_trace,
+        n_local=n_local,
+        n_cross=n_cross,
+        n_global=n_global,
+        n_trace=n_trace,
         qa_community_level=args.qa_community_level,
         seed=args.seed,
+        append=args.append,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import math
 import sys
@@ -39,6 +40,18 @@ def _g(obj, key: str, default):
 def _load_queries(path: str) -> list[dict]:
     rows = []
     with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+def _load_jsonl(path: str) -> list[dict]:
+    p = Path(path)
+    if not p.exists():
+        return []
+    rows = []
+    with p.open("r", encoding="utf-8") as f:
         for line in f:
             if line.strip():
                 rows.append(json.loads(line))
@@ -348,6 +361,7 @@ def run_compare(
     metrics_file: str,
     regimes: str,
     budget_config_file: str,
+    incremental_only: bool = False,
 ) -> dict:
     _progress(f"loading queries: {queries_file}")
     queries = _load_queries(queries_file)
@@ -378,7 +392,32 @@ def run_compare(
         model_name=(cfg.llm.api.model if cfg.llm.backend == "api" else cfg.llm.local.model),
     )
 
-    rows: list[dict] = []
+    existing_rows: list[dict] = _load_jsonl(out_file) if incremental_only else []
+    existing_qids = {
+        str(r.get("qid", "")).strip()
+        for r in existing_rows
+        if str(r.get("qid", "")).strip()
+    }
+    existing_queries = {
+        str(r.get("query", "")).strip().lower()
+        for r in existing_rows
+        if str(r.get("query", "")).strip()
+    }
+    if incremental_only:
+        filtered_queries: list[dict] = []
+        for q in queries:
+            qid = str(q.get("qid", "")).strip()
+            qtext = str(q.get("query", "")).strip().lower()
+            if (qid and qid in existing_qids) or (qtext and qtext in existing_queries):
+                continue
+            filtered_queries.append(q)
+        _progress(
+            f"incremental mode: existing={len(existing_rows)}, pending={len(filtered_queries)}, skipped={len(queries) - len(filtered_queries)}"
+        )
+        queries = filtered_queries
+
+    rows: list[dict] = list(existing_rows)
+    new_rows: list[dict] = []
     aggregate: dict[str, dict[str, Telemetry]] = {
         rg: {"vector_rag": Telemetry(), "kg_rag": Telemetry(), "graph_rag": Telemetry()}
         for rg in regime_names
@@ -416,33 +455,53 @@ def run_compare(
                 kg_manager = None
                 graph_manager = None
 
-            _progress(f"query {idx}/{len(queries)} regime={rg}: vector_rag")
-            vector_out, vector_t = _run_vector(
-                query=query,
-                idx_file=idx_file,
-                store_file=store_file,
-                top_k=vector_top_k,
-                max_context_chars=vector_context_chars,
-                max_chunks=vector_top_k if is_budget else None,
-                max_completion_tokens=budget["max_completion_tokens"] if is_budget else None,
-                budget_manager=vector_manager,
-            )
-            _progress(f"query {idx}/{len(queries)} regime={rg}: kg_rag")
-            kg_out = answer_with_kg(
-                query=query,
-                graph_file=graph_file,
-                store_file=store_file,
-                max_completion_tokens=budget["max_completion_tokens"] if is_budget else None,
-                **kg_kwargs,
-            )
-            _progress(f"query {idx}/{len(queries)} regime={rg}: graph_rag")
-            graph_out = answer_with_graphrag(
-                query=query,
-                graph_file=graph_file,
-                communities_file=communities_file,
-                max_completion_tokens=budget["max_completion_tokens"] if is_budget else None,
-                **graph_kwargs,
-            )
+            _progress(f"query {idx}/{len(queries)} regime={rg}: running 3 branches in parallel")
+            branch_results: dict[str, dict | tuple[dict, dict]] = {}
+
+            def _run_vector_branch() -> tuple[dict, dict]:
+                return _run_vector(
+                    query=query,
+                    idx_file=idx_file,
+                    store_file=store_file,
+                    top_k=vector_top_k,
+                    max_context_chars=vector_context_chars,
+                    max_chunks=vector_top_k if is_budget else None,
+                    max_completion_tokens=budget["max_completion_tokens"] if is_budget else None,
+                    budget_manager=vector_manager,
+                )
+
+            def _run_kg_branch() -> dict:
+                return answer_with_kg(
+                    query=query,
+                    graph_file=graph_file,
+                    store_file=store_file,
+                    max_completion_tokens=budget["max_completion_tokens"] if is_budget else None,
+                    **kg_kwargs,
+                )
+
+            def _run_graph_branch() -> dict:
+                return answer_with_graphrag(
+                    query=query,
+                    graph_file=graph_file,
+                    communities_file=communities_file,
+                    max_completion_tokens=budget["max_completion_tokens"] if is_budget else None,
+                    **graph_kwargs,
+                )
+
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = {
+                    executor.submit(_run_vector_branch): "vector_rag",
+                    executor.submit(_run_kg_branch): "kg_rag",
+                    executor.submit(_run_graph_branch): "graph_rag",
+                }
+                for future in as_completed(futures):
+                    name = futures[future]
+                    branch_results[name] = future.result()
+                    _progress(f"query {idx}/{len(queries)} regime={rg}: {name} done")
+
+            vector_out, vector_t = branch_results["vector_rag"]  # type: ignore[assignment]
+            kg_out = branch_results["kg_rag"]  # type: ignore[assignment]
+            graph_out = branch_results["graph_rag"]  # type: ignore[assignment]
 
             vector_agg_t = vector_t
             kg_agg_t = kg_out.get("telemetry", {})
@@ -578,6 +637,7 @@ def run_compare(
             }
             _progress(f"query {idx}/{len(queries)} regime={rg}: done")
         rows.append(row)
+        new_rows.append(row)
         _progress(f"query {idx}/{len(queries)} done: qid={qid}")
 
     _progress(f"writing answers: {out_file}")
@@ -602,10 +662,13 @@ def run_compare(
     summary = {
         "queries_file": queries_file,
         "num_queries": len(rows),
+        "num_existing_answers": len(existing_rows),
+        "num_processed_this_run": len(new_rows),
         "regimes": regime_names,
         "top_k": top_k,
         "budget": budget,
         "budget_config_file": budget_config_file,
+        "incremental_only": incremental_only,
         "graph_assets_metrics": graph_metrics,
         "indexing_metrics": _load_indexing_metrics(graph_metrics),
         "graph_structure_metrics": {},
@@ -649,6 +712,11 @@ def main() -> None:
         default="both",
     )
     parser.add_argument("--budget-config-file", default="config_budget.yaml")
+    parser.add_argument(
+        "--incremental-only",
+        action="store_true",
+        help="Only process unanswered queries and keep existing answers in out-file",
+    )
     args = parser.parse_args()
 
     summary = run_compare(
@@ -664,6 +732,7 @@ def main() -> None:
         metrics_file=args.metrics_file,
         regimes=args.regimes,
         budget_config_file=args.budget_config_file,
+        incremental_only=args.incremental_only,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

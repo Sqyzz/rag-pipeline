@@ -239,19 +239,6 @@ def _regime_settings(top_k: int, budget_cfg_yaml: dict | None = None) -> dict[st
     return out
 
 
-def _empty_method_payload() -> dict[str, Any]:
-    return {
-        "answer": "",
-        "communities": [],
-        "community_summaries": [],
-        "map_partial_answers": [],
-        "subgraph_edges": [],
-        "evidence": [],
-        "evidence_chunks": [],
-        "telemetry": Telemetry().to_dict(),
-    }
-
-
 def ensure_youtu_graph_assets(
     *,
     chunks_file: str,
@@ -483,14 +470,9 @@ def run_youtu_graphrag_test(
     graph_error_count = 0
     graph_success_count = 0
     graph_error_samples: list[str] = []
-    aggregate: dict[str, dict[str, Telemetry]] = {
-        rg: {"vector_rag": Telemetry(), "kg_rag": Telemetry(), "graph_rag": Telemetry()}
-        for rg in regime_names
-    }
+    aggregate: dict[str, dict[str, Telemetry]] = {rg: {"graph_rag": Telemetry()} for rg in regime_names}
     by_type: dict[str, dict[str, dict[str, Telemetry]]] = {rg: {} for rg in regime_names}
-    latency_samples: dict[str, dict[str, list[int]]] = {
-        rg: {"vector_rag": [], "kg_rag": [], "graph_rag": []} for rg in regime_names
-    }
+    latency_samples: dict[str, dict[str, list[int]]] = {rg: {"graph_rag": []} for rg in regime_names}
 
     for idx, q in enumerate(queries, start=1):
         query = q["query"]
@@ -561,18 +543,14 @@ def run_youtu_graphrag_test(
             _merge_telemetry(aggregate[rg]["graph_rag"], graph_agg_t)
             by_type[rg].setdefault(
                 qtype,
-                {"vector_rag": Telemetry(), "kg_rag": Telemetry(), "graph_rag": Telemetry()},
+                {"graph_rag": Telemetry()},
             )
             _merge_telemetry(by_type[rg][qtype]["graph_rag"], graph_agg_t)
 
-            latency_samples[rg]["vector_rag"].append(0)
-            latency_samples[rg]["kg_rag"].append(0)
             latency_samples[rg]["graph_rag"].append(
                 int(graph_agg_t.get("llm_latency_ms", 0)) + int(graph_agg_t.get("embedding_latency_ms", 0))
             )
 
-            vector_out = _empty_method_payload()
-            kg_out = _empty_method_payload()
             if is_budget:
                 err = None
                 if not usage_complete:
@@ -587,20 +565,8 @@ def run_youtu_graphrag_test(
                     "manager": graph_manager.to_dict(),
                     "error": err,
                 }
-                vector_out["budget_check"] = {
-                    **_check_budget(vector_out["telemetry"], budget),
-                    "manager": {"method": "vector_rag", "regime": rg, "used": {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
-                    "error": None,
-                }
-                kg_out["budget_check"] = {
-                    **_check_budget(kg_out["telemetry"], budget),
-                    "manager": {"method": "kg_rag", "regime": rg, "used": {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
-                    "error": None,
-                }
 
             row["regimes"][rg] = {
-                "vector_rag": vector_out,
-                "kg_rag": kg_out,
                 "graph_rag": graph_out,
             }
 
@@ -620,7 +586,7 @@ def run_youtu_graphrag_test(
     aggregate_view = {}
     for rg in regime_names:
         aggregate_view[rg] = {}
-        for method in ("vector_rag", "kg_rag", "graph_rag"):
+        for method in ("graph_rag",):
             telemetry_dict = aggregate[rg][method].to_dict()
             telemetry_dict["latency_ms"] = _latency_stats(latency_samples[rg][method])
             aggregate_view[rg][method] = telemetry_dict
@@ -630,7 +596,7 @@ def run_youtu_graphrag_test(
         by_type_view[rg] = {}
         for qtype, bundle in by_type[rg].items():
             by_type_view[rg][qtype] = {}
-            for method in ("vector_rag", "kg_rag", "graph_rag"):
+            for method in ("graph_rag",):
                 by_type_view[rg][qtype][method] = bundle[method].to_dict()
 
     summary = {
