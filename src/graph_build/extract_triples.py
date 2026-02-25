@@ -63,6 +63,23 @@ def _safe_json_loads(content: str):
         return json.loads(m.group(1))
 
 
+def _normalize_entity_text(text: str) -> str:
+    """Light normalization to reduce trivial surface-form drift."""
+    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    t = t.strip("`\"' ")
+    t = re.sub(r"^[,;:.()\[\]{}]+|[,;:.()\[\]{}]+$", "", t).strip()
+    return t
+
+
+def _normalize_relation_text(text: str) -> str:
+    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    t = t.strip("`\"' ")
+    t = re.sub(r"[_/]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"^[,;:.()\[\]{}]+|[,;:.()\[\]{}]+$", "", t).strip()
+    return t.lower()
+
+
 def _load_schema(schema_file: str | None) -> dict[str, Any] | None:
     if not schema_file:
         return None
@@ -79,6 +96,7 @@ def _compile_schema(schema: dict[str, Any] | None) -> dict[str, Any]:
     if not schema:
         return {"enabled": False}
     entity_types = {str(x).strip() for x in schema.get("entity_types", []) if str(x).strip()}
+    entity_type_alias_to_name: dict[str, str] = {t.lower(): t for t in entity_types}
     rel_rows = schema.get("relations", [])
     relation_alias_to_name: dict[str, str] = {}
     relation_constraints: dict[str, dict[str, set[str]]] = {}
@@ -101,6 +119,7 @@ def _compile_schema(schema: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "enabled": True,
         "entity_types": entity_types,
+        "entity_type_alias_to_name": entity_type_alias_to_name,
         "relation_alias_to_name": relation_alias_to_name,
         "relation_constraints": relation_constraints,
     }
@@ -127,22 +146,22 @@ def _validate_row_to_triple(
     chunk_id: str,
     compiled_schema: dict[str, Any],
 ) -> Triple | None:
-    s = str(row.get("subject", "")).strip()
-    r_raw = str(row.get("relation", "")).strip()
-    o = str(row.get("object", "")).strip()
+    s = _normalize_entity_text(row.get("subject", ""))
+    r_raw = _normalize_relation_text(row.get("relation", ""))
+    o = _normalize_entity_text(row.get("object", ""))
     e = str(row.get("evidence", "")).strip()
-    st = str(row.get("subject_type", "")).strip()
-    ot = str(row.get("object_type", "")).strip()
+    st_raw = str(row.get("subject_type", "")).strip()
+    ot_raw = str(row.get("object_type", "")).strip()
     if not (s and r_raw and o):
         return None
     if not compiled_schema.get("enabled"):
         return Triple(
             chunk_id=chunk_id,
             subject=s,
-            subject_type=st or "unknown",
+            subject_type=st_raw or "unknown",
             relation=r_raw,
             object=o,
-            object_type=ot or "unknown",
+            object_type=ot_raw or "unknown",
             evidence=e,
         )
 
@@ -150,6 +169,9 @@ def _validate_row_to_triple(
     relation = alias_map.get(r_raw.lower())
     if not relation:
         return None
+    type_alias_map = compiled_schema["entity_type_alias_to_name"]
+    st = type_alias_map.get(st_raw.lower(), st_raw)
+    ot = type_alias_map.get(ot_raw.lower(), ot_raw)
     entity_types = compiled_schema["entity_types"]
     if st not in entity_types or ot not in entity_types:
         return None
@@ -198,6 +220,7 @@ Rules:
 2) Use explicit entities, avoid pronouns.
 3) Extract at most 8 triples.
 4) If no confident triple, return [].
+5) Use canonical entity names consistently (e.g., avoid alternating abbreviations/full names in the same chunk).
 
 Text:
 \"\"\"
@@ -256,6 +279,7 @@ Rules:
 3) At most 8 triples per chunk.
 4) If no confident triple for a chunk, emit none for that chunk.
 5) chunk_id must come from input.
+6) Use canonical entity names consistently within and across chunks when possible.
 """
     content, meta = llm_chat(
         [{"role": "user", "content": prompt}],

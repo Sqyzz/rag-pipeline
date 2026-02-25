@@ -36,13 +36,21 @@ def sync_chunks_to_youtu_dataset(
             if not line:
                 continue
             row = json.loads(line)
+            chunk_id = str(row.get("chunk_id", "") or "").strip()
+            text = str(row.get("text", "") or "")
+            doc_id = row.get("doc_id")
+            # youtu-graphrag expects list[{"title","text"}] (see youtu-graphrag/backend.py::validate_corpus_format).
+            # To preserve evidence alignment with enterprise-graphrag evaluation, we ALSO include chunk_id
+            # so youtu-graphrag's KTBuilder can reuse it instead of generating nanoid IDs.
+            title = str(doc_id) if doc_id is not None else chunk_id
+            if not title:
+                title = f"{dataset}_chunk"
             rows.append(
                 {
-                    "id": str(row.get("chunk_id", "")),
-                    "text": str(row.get("text", "")),
-                    "metadata": {
-                        "doc_id": row.get("doc_id"),
-                    },
+                    "title": title,
+                    "text": text,
+                    "chunk_id": chunk_id,
+                    "doc_id": doc_id,
                 }
             )
 

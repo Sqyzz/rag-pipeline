@@ -102,8 +102,8 @@ python src/graph_build/build_communities.py \
   --graph-file outputs/graph/graph.json \
   --out-file outputs/graph/communities.json \
   --resolutions 0.6,1.0,1.6 \
-  --summary-level-max 0 \
-  --summary-min-size 20 \
+  --summary-level-max 1 \
+  --summary-min-size 15 \
   --summary-top-per-level 200
 ```
 
@@ -303,6 +303,6 @@ python src/evaluation/graph_structure_metrics.py \
 - 如果 API 返回不含 `usage`，token 统计会记为 0（请在论文中注明供应商返回限制）。
 - GraphRAG 当前严格采用“社区摘要 map-reduce”策略：query-time 不直接拼接 triples/edges。
 - KG-RAG 当前采用实体链接 + 多跳遍历，并使用统一 embedding 对 traversal 证据进行语义重排。
-- `budget_matched` 下 GraphRAG 如首次超预算，会触发一次 adaptive shrink 重跑，因此日志里会看到该方法再次出现 embedding 进度条。
+- `budget_matched` 下 GraphRAG 默认单次执行；仅当 `comparison.budget_matched.graph.adaptive_retry=true`（或 `config_budget.yaml` 的 `budget.graph.adaptive_retry=true`）且首次超预算时，才会触发一次 adaptive shrink 重跑。
 - `run_compare.py` **不会自动构建 FAISS 索引**：请先执行 `run_baselines.py --mode build_only`，或手动用 `vector_rag.build_index(...)` 生成 `idx/store`。
 - 如果 `qa_builder.py` 输出中 `graph_chunk_mention_coverage` 很低（例如接近 0），通常是 `chunk_store` 与 `graph/triples` 不是同一套 sampled/full 资产，需重建或切换到一致文件。

@@ -3,17 +3,17 @@ regime: budget_matched
 budget:
   evidence_token_limit: 2500
   max_completion_tokens: 800
-  max_llm_calls: 2
+  max_llm_calls: 3
   max_total_tokens: 3800
 
   vector:
     max_chunks: 8
 
   kg:
-    max_hops: 2
+    max_hops: 3
     max_nodes: 30
 
   graph:
-    max_communities: 3
+    max_communities: 2
     summary_level: 2
     map_keypoints_limit: 5

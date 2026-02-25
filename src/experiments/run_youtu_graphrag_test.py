@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import math
 import sys
@@ -17,6 +18,7 @@ try:
     from adapters.youtu_client import YoutuClient
     from adapters.youtu_dataset_sync import sync_chunks_to_youtu_dataset
     from adapters.youtu_graph_state import build_state_payload, decide_graph_reuse, save_graph_state
+    from adapters.youtu_schema_adapter import load_and_adapt_schema
     from baselines.youtu_graph_rag_adapter import answer_with_youtu_graphrag
     from evaluation.graph_structure_metrics import compute_graph_structure_metrics
     from experiments.run_compare import ensure_graph_assets
@@ -28,6 +30,7 @@ except ModuleNotFoundError:
     from src.adapters.youtu_client import YoutuClient
     from src.adapters.youtu_dataset_sync import sync_chunks_to_youtu_dataset
     from src.adapters.youtu_graph_state import build_state_payload, decide_graph_reuse, save_graph_state
+    from src.adapters.youtu_schema_adapter import load_and_adapt_schema
     from src.baselines.youtu_graph_rag_adapter import answer_with_youtu_graphrag
     from src.evaluation.graph_structure_metrics import compute_graph_structure_metrics
     from src.experiments.run_compare import ensure_graph_assets
@@ -58,6 +61,18 @@ def _parse_bool(raw: str | bool) -> bool:
 def _load_queries(path: str) -> list[dict]:
     rows = []
     with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+def _load_jsonl(path: str) -> list[dict]:
+    p = Path(path)
+    if not p.exists():
+        return []
+    rows = []
+    with p.open("r", encoding="utf-8") as f:
         for line in f:
             if line.strip():
                 rows.append(json.loads(line))
@@ -205,6 +220,7 @@ def _regime_settings(top_k: int, budget_cfg_yaml: dict | None = None) -> dict[st
         },
         "budget_matched": {
             "vector_top_k": int(_g(budget, "vector_top_k", min(top_k, 3))),
+            "graph_budget_adaptive_retry": _parse_bool(_g(budget_graph, "adaptive_retry", False)),
             "graph_kwargs": {
                 "top_communities": int(_g(budget_graph, "top_communities", 1)),
                 "max_evidence": int(_g(budget_graph, "max_evidence", 6)),
@@ -236,6 +252,9 @@ def _regime_settings(top_k: int, budget_cfg_yaml: dict | None = None) -> dict[st
             ((y_budget.get("graph") or {}).get("map_keypoints_limit"))
             or out["budget_matched"]["graph_kwargs"]["map_keypoints_limit"]
         )
+        y_adaptive_retry = (y_budget.get("graph") or {}).get("adaptive_retry")
+        if y_adaptive_retry is not None:
+            out["budget_matched"]["graph_budget_adaptive_retry"] = _parse_bool(y_adaptive_retry)
     return out
 
 
@@ -247,6 +266,8 @@ def ensure_youtu_graph_assets(
     communities_file: str,
     youtu_base_url: str,
     youtu_dataset: str,
+    youtu_schema: dict[str, Any] | None,
+    youtu_schema_meta: dict[str, Any],
     graph_state_file: str,
     reuse_graph: bool,
     force_rebuild: bool,
@@ -261,10 +282,12 @@ def ensure_youtu_graph_assets(
     build_params = {
         "dataset": youtu_dataset,
         "chunks_file": chunks_file,
-        "sync_mode": sync_mode,
-        "graph_file": graph_file,
-        "communities_file": communities_file,
+        # sync_mode excluded: it controls transfer method, not graph content.
+        # Including it would break cache hits when switching from shared_dir to none.
     }
+    if youtu_schema is not None:
+        build_params["schema_sha256"] = youtu_schema_meta.get("schema_sha256")
+        build_params["schema_file"] = youtu_schema_meta.get("schema_file")
 
     require_local_assets = bool(export_youtu_artifacts)
     decision = decide_graph_reuse(
@@ -285,7 +308,8 @@ def ensure_youtu_graph_assets(
             "reason": decision["reason"],
             "fingerprint": decision["fingerprint"],
             "fingerprint_method": decision.get("fingerprint_method"),
-        }
+        },
+        "youtu_schema": youtu_schema_meta,
     }
 
     # Bootstrap local reuse when state file is missing but local artifacts already exist.
@@ -306,6 +330,8 @@ def ensure_youtu_graph_assets(
                 "chunks_fingerprint": decision["fingerprint"],
                 "sync_mode": sync_mode,
                 "bootstrap_from_local_assets": True,
+                "schema_sha256": youtu_schema_meta.get("schema_sha256"),
+                "schema_file": youtu_schema_meta.get("schema_file"),
             },
             graph_task_id=None,
         )
@@ -337,11 +363,14 @@ def ensure_youtu_graph_assets(
     result["youtu_sync"] = sync_meta
 
     construct_started = time.time()
-    task_id = youtu_client.construct_graph(
-        dataset_name=youtu_dataset,
-        chunks_source=sync_meta.get("written_file") or sync_meta.get("chunks_source"),
-        chunks_fingerprint=decision["fingerprint"],
-    )
+    construct_kwargs = {
+        "dataset_name": youtu_dataset,
+        "chunks_source": sync_meta.get("written_file") or sync_meta.get("chunks_source"),
+        "chunks_fingerprint": decision["fingerprint"],
+    }
+    if youtu_schema is not None:
+        construct_kwargs["schema"] = youtu_schema
+    task_id = youtu_client.construct_graph(**construct_kwargs)
     final_status = youtu_client.poll_construct(
         task_id=task_id,
         timeout_sec=construct_timeout_sec,
@@ -389,6 +418,8 @@ def ensure_youtu_graph_assets(
             "chunks_source": sync_meta.get("written_file") or sync_meta.get("chunks_source"),
             "chunks_fingerprint": decision["fingerprint"],
             "sync_mode": sync_meta.get("sync_mode", sync_mode),
+            "schema_sha256": youtu_schema_meta.get("schema_sha256"),
+            "schema_file": youtu_schema_meta.get("schema_file"),
         },
         graph_task_id=task_id,
     )
@@ -412,12 +443,14 @@ def run_youtu_graphrag_test(
     force_rebuild: bool,
     youtu_base_url: str,
     youtu_dataset: str,
+    youtu_schema_file: str | None,
     export_youtu_artifacts: bool,
     construct_poll_sec: int,
     construct_timeout_sec: int,
     sync_mode: str,
     shared_corpus_dir: str,
     max_queries: int | None,
+    incremental_only: bool,
 ) -> dict[str, Any]:
     _progress(f"loading queries: {queries_file}")
     queries = _load_queries(queries_file)
@@ -426,6 +459,8 @@ def run_youtu_graphrag_test(
     _progress(f"loaded queries: {len(queries)}")
 
     _progress("ensuring youtu graph assets")
+    youtu_schema, youtu_schema_meta = load_and_adapt_schema(youtu_schema_file)  # type: ignore[name-defined]
+    _progress(f"youtu schema config: {json.dumps(youtu_schema_meta, ensure_ascii=False)}")
     graph_metrics = ensure_youtu_graph_assets(
         chunks_file=chunks_file,
         triples_file=triples_file,
@@ -433,6 +468,8 @@ def run_youtu_graphrag_test(
         communities_file=communities_file,
         youtu_base_url=youtu_base_url,
         youtu_dataset=youtu_dataset,
+        youtu_schema=youtu_schema,
+        youtu_schema_meta=youtu_schema_meta,
         graph_state_file=graph_state_file,
         reuse_graph=reuse_graph,
         force_rebuild=force_rebuild,
@@ -465,7 +502,32 @@ def run_youtu_graphrag_test(
         model_name=(cfg.llm.api.model if cfg.llm.backend == "api" else cfg.llm.local.model),
     )
 
-    rows: list[dict] = []
+    existing_rows: list[dict] = _load_jsonl(out_file) if incremental_only else []
+    existing_qids = {
+        str(r.get("qid", "")).strip()
+        for r in existing_rows
+        if str(r.get("qid", "")).strip()
+    }
+    existing_queries = {
+        str(r.get("query", "")).strip().lower()
+        for r in existing_rows
+        if str(r.get("query", "")).strip()
+    }
+    if incremental_only:
+        filtered_queries: list[dict] = []
+        for q in queries:
+            qid = str(q.get("qid", "")).strip()
+            qtext = str(q.get("query", "")).strip().lower()
+            if (qid and qid in existing_qids) or (qtext and qtext in existing_queries):
+                continue
+            filtered_queries.append(q)
+        _progress(
+            f"incremental mode: existing={len(existing_rows)}, pending={len(filtered_queries)}, skipped={len(queries) - len(filtered_queries)}"
+        )
+        queries = filtered_queries
+
+    rows: list[dict] = list(existing_rows)
+    new_rows: list[dict] = []
     graph_attempts = 0
     graph_error_count = 0
     graph_success_count = 0
@@ -480,11 +542,18 @@ def run_youtu_graphrag_test(
         qtype = q.get("type", "unknown")
         _progress(f"query {idx}/{len(queries)} start: qid={qid} type={qtype}")
         row = {"qid": qid, "type": qtype, "query": query, "regimes": {}}
+        _progress(f"query {idx}/{len(queries)} running regimes in parallel")
 
-        for rg in regime_names:
+        def _run_regime(rg: str) -> dict[str, Any]:
             is_budget = rg == "budget_matched"
             graph_kwargs = settings[rg]["graph_kwargs"]
+            graph_budget_adaptive_retry = _parse_bool(settings[rg].get("graph_budget_adaptive_retry", False))
             graph_manager = BudgetManager(tokenizer=tokenizer, cfg=budget, method="graph_rag", regime=rg) if is_budget else None
+
+            attempts = 1
+            error_count = 0
+            success_count = 0
+            errors: list[str] = []
 
             graph_out = answer_with_youtu_graphrag(
                 query=query,
@@ -496,18 +565,21 @@ def run_youtu_graphrag_test(
                 **graph_kwargs,
             )
             graph_agg_t = graph_out.get("telemetry", {})
-            graph_attempts += 1
             graph_error = str((((graph_agg_t.get("extra") or {}).get("error")) or "")).strip()
             if graph_error:
-                graph_error_count += 1
-                if len(graph_error_samples) < 3:
-                    graph_error_samples.append(graph_error)
+                error_count += 1
+                if len(errors) < 3:
+                    errors.append(graph_error)
             elif str(graph_out.get("answer", "")).strip():
-                graph_success_count += 1
+                success_count += 1
             budget_view = _check_budget(graph_agg_t, budget)
             usage_complete = bool((((graph_agg_t.get("extra") or {}).get("usage_complete", True))))
 
-            if is_budget and (not budget_view.get("within_budget", False) or not usage_complete):
+            if (
+                is_budget
+                and graph_budget_adaptive_retry
+                and (not budget_view.get("within_budget", False) or not usage_complete)
+            ):
                 tighter_graph_kwargs = dict(graph_kwargs)
                 tighter_graph_kwargs["top_communities"] = 1
                 tighter_graph_kwargs["use_map_reduce"] = False
@@ -530,26 +602,17 @@ def run_youtu_graphrag_test(
                     "adapted_graph_kwargs": tighter_graph_kwargs,
                     "reason": "over_budget_or_incomplete_usage",
                 }
+                attempts += 1
                 graph_agg_t = graph_out.get("telemetry", {})
                 graph_error = str((((graph_agg_t.get("extra") or {}).get("error")) or "")).strip()
                 if graph_error:
-                    graph_error_count += 1
-                    if len(graph_error_samples) < 3:
-                        graph_error_samples.append(graph_error)
+                    error_count += 1
+                    if len(errors) < 3:
+                        errors.append(graph_error)
                 elif str(graph_out.get("answer", "")).strip():
-                    graph_success_count += 1
+                    success_count += 1
                 budget_view = _check_budget(graph_agg_t, budget)
-
-            _merge_telemetry(aggregate[rg]["graph_rag"], graph_agg_t)
-            by_type[rg].setdefault(
-                qtype,
-                {"graph_rag": Telemetry()},
-            )
-            _merge_telemetry(by_type[rg][qtype]["graph_rag"], graph_agg_t)
-
-            latency_samples[rg]["graph_rag"].append(
-                int(graph_agg_t.get("llm_latency_ms", 0)) + int(graph_agg_t.get("embedding_latency_ms", 0))
-            )
+                usage_complete = bool((((graph_agg_t.get("extra") or {}).get("usage_complete", True))))
 
             if is_budget:
                 err = None
@@ -559,18 +622,57 @@ def run_youtu_graphrag_test(
                     graph_manager.register_from_telemetry(graph_agg_t, stage="graph_answer")
                 except RuntimeError as exc:
                     err = str(exc)
-
                 graph_out["budget_check"] = {
                     **budget_view,
                     "manager": graph_manager.to_dict(),
                     "error": err,
                 }
 
+            return {
+                "rg": rg,
+                "graph_out": graph_out,
+                "graph_agg_t": graph_agg_t,
+                "attempts": attempts,
+                "error_count": error_count,
+                "success_count": success_count,
+                "error_samples": errors,
+            }
+
+        max_workers = min(3, len(regime_names)) or 1
+        regime_results: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_run_regime, rg): rg for rg in regime_names}
+            for future in as_completed(futures):
+                rg = futures[future]
+                regime_results.append(future.result())
+                _progress(f"query {idx}/{len(queries)} regime={rg} done")
+
+        for item in regime_results:
+            rg = str(item["rg"])
+            graph_out = item["graph_out"]
+            graph_agg_t = item["graph_agg_t"]
+            graph_attempts += int(item["attempts"])
+            graph_error_count += int(item["error_count"])
+            graph_success_count += int(item["success_count"])
+            for err in item["error_samples"]:
+                if len(graph_error_samples) < 3:
+                    graph_error_samples.append(str(err))
+
+            _merge_telemetry(aggregate[rg]["graph_rag"], graph_agg_t)
+            by_type[rg].setdefault(
+                qtype,
+                {"graph_rag": Telemetry()},
+            )
+            _merge_telemetry(by_type[rg][qtype]["graph_rag"], graph_agg_t)
+            latency_samples[rg]["graph_rag"].append(
+                int(graph_agg_t.get("llm_latency_ms", 0)) + int(graph_agg_t.get("embedding_latency_ms", 0))
+            )
             row["regimes"][rg] = {
                 "graph_rag": graph_out,
             }
 
         rows.append(row)
+        new_rows.append(row)
         _progress(f"query {idx}/{len(queries)} done: qid={qid}")
 
     _progress(f"writing answers: {out_file}")
@@ -602,10 +704,13 @@ def run_youtu_graphrag_test(
     summary = {
         "queries_file": queries_file,
         "num_queries": len(rows),
+        "num_existing_answers": len(existing_rows),
+        "num_processed_this_run": len(new_rows),
         "regimes": regime_names,
         "top_k": top_k,
         "budget": budget,
         "budget_config_file": budget_config_file,
+        "incremental_only": incremental_only,
         "graph_assets_metrics": graph_metrics,
         "indexing_metrics": _load_indexing_metrics(graph_metrics),
         "graph_structure_metrics": {},
@@ -654,8 +759,9 @@ def main() -> None:
     parser.add_argument("--force-rebuild", default="false")
     parser.add_argument("--graph-state-file", default="outputs/graph/youtu_graph_state.json")
 
-    parser.add_argument("--youtu-base-url", default=str(_g(youtu, "base_url", "http://127.0.0.1:8000")))
+    parser.add_argument("--youtu-base-url", default=str(_g(youtu, "base_url", "http://127.0.0.1:8080")))
     parser.add_argument("--youtu-dataset", default=str(_g(youtu, "dataset", "enterprise")))
+    parser.add_argument("--youtu-schema-file", default=str(_g(youtu, "schema_file", "config_triple_schema.json")))
     parser.add_argument("--export-youtu-artifacts", default="true")
     parser.add_argument("--construct-poll-sec", type=int, default=int(_g(youtu, "construct_poll_sec", 2)))
     parser.add_argument("--construct-timeout-sec", type=int, default=int(_g(youtu, "construct_timeout_sec", 1800)))
@@ -663,6 +769,11 @@ def main() -> None:
     parser.add_argument("--sync-mode", choices=["none", "shared_dir"], default="none")
     parser.add_argument("--shared-corpus-dir", default="outputs/youtu_sync")
     parser.add_argument("--max-queries", type=int, default=None)
+    parser.add_argument(
+        "--incremental-only",
+        action="store_true",
+        help="Only process unanswered queries and keep existing answers in out-file",
+    )
 
     args = parser.parse_args()
     summary = run_youtu_graphrag_test(
@@ -681,12 +792,14 @@ def main() -> None:
         force_rebuild=_parse_bool(args.force_rebuild),
         youtu_base_url=args.youtu_base_url,
         youtu_dataset=args.youtu_dataset,
+        youtu_schema_file=args.youtu_schema_file,
         export_youtu_artifacts=_parse_bool(args.export_youtu_artifacts),
         construct_poll_sec=args.construct_poll_sec,
         construct_timeout_sec=args.construct_timeout_sec,
         sync_mode=args.sync_mode,
         shared_corpus_dir=args.shared_corpus_dir,
         max_queries=args.max_queries,
+        incremental_only=args.incremental_only,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

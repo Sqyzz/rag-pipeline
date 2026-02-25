@@ -48,6 +48,23 @@ def _resolve_youtu_settings() -> dict[str, Any]:
 
 def _to_chunk_evidence(data: dict[str, Any]) -> list[dict[str, Any]]:
     raw = data.get("retrieved_chunks") or data.get("evidence_chunks") or data.get("chunks") or []
+    # youtu-graphrag backend returns:
+    # - retrieved_chunk_ids: List[str]
+    # - retrieved_chunks: List[str]
+    # We must zip them to keep chunk_id evidence aligned with gold QA.
+    if (
+        isinstance(raw, list)
+        and raw
+        and all(isinstance(x, str) for x in raw)
+        and isinstance(data.get("retrieved_chunk_ids"), list)
+    ):
+        ids = [str(x or "").strip() for x in (data.get("retrieved_chunk_ids") or [])]
+        if ids:
+            zipped = []
+            for i, text in enumerate(raw):
+                chunk_id = ids[i] if i < len(ids) else ""
+                zipped.append({"chunk_id": chunk_id, "text": str(text or "")})
+            raw = zipped
     out: list[dict[str, Any]] = []
     for item in raw:
         if isinstance(item, dict):
@@ -77,17 +94,27 @@ def _to_chunk_evidence(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _to_subgraph_edges(data: dict[str, Any]) -> list[dict[str, Any]]:
     raw = data.get("retrieved_triples") or data.get("retrieved_edges") or data.get("subgraph_edges") or []
+    # Prefer structured triples if provided by youtu-graphrag backend.
+    if isinstance(data.get("retrieved_triples_struct"), list) and data.get("retrieved_triples_struct"):
+        raw = data.get("retrieved_triples_struct") or raw
     out: list[dict[str, Any]] = []
     for item in raw:
         if isinstance(item, dict):
+            # youtu-graphrag uses subject/relation/object (+score) naming.
+            source = item.get("source") if item.get("source") is not None else item.get("subject")
+            relation = item.get("relation")
+            target = item.get("target") if item.get("target") is not None else item.get("object")
+            edge_id = str(item.get("edge_id", "") or "").strip()
+            if not edge_id and source and relation and target:
+                edge_id = f"{source}|{relation}|{target}"
             out.append(
                 {
-                    "edge_id": str(item.get("edge_id", "") or ""),
-                    "source": item.get("source"),
-                    "relation": item.get("relation"),
-                    "target": item.get("target"),
+                    "edge_id": edge_id,
+                    "source": source,
+                    "relation": relation,
+                    "target": target,
                     "text": item.get("text"),
-                    "weight": item.get("weight"),
+                    "weight": item.get("weight") if item.get("weight") is not None else item.get("score"),
                 }
             )
         else:

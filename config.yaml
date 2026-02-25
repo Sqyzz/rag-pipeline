@@ -64,6 +64,7 @@ comparison:
       shuffle_communities: false
       use_map_reduce: true
       max_summary_chars: 1200
+      adaptive_retry: false
     budget:
       max_prompt_tokens: 3000
       max_completion_tokens: 800
@@ -72,9 +73,9 @@ comparison:
 
 youtu:
   base_url: http://127.0.0.1:8080
-  dataset: enterprise
-  timeout_sec: 120
+  dataset: enron
+  timeout_sec: 360
   construct_poll_sec: 2
-  construct_timeout_sec: 1800
+  construct_timeout_sec: 4000
   max_retries: 2
   retry_sleep_sec: 1.0

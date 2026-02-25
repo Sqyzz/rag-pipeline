@@ -168,10 +168,36 @@ def _collect_gold_ids(gold_row: dict) -> dict[str, set[str]]:
     }
 
 
+def _has_compare_layout(row: dict) -> bool:
+    regimes = row.get("regimes")
+    return isinstance(regimes, dict) and bool(regimes)
+
+
+def _detect_compare_methods(pred_rows: list[dict]) -> tuple[str, ...]:
+    found: set[str] = set()
+    for row in pred_rows:
+        if not isinstance(row, dict):
+            continue
+        regimes = row.get("regimes")
+        if not isinstance(regimes, dict):
+            continue
+        for by_method in regimes.values():
+            if not isinstance(by_method, dict):
+                continue
+            for method in by_method.keys():
+                m = str(method).strip()
+                if m:
+                    found.add(m)
+    if found:
+        return tuple(sorted(found))
+    return METHODS
+
+
 def _eval_compare(
     pred_rows: list[dict],
     gold_map: dict[str, dict],
     include_evidence: bool,
+    methods: tuple[str, ...],
     community_chunk_map: dict[str, set[str]] | None = None,
 ) -> list[dict]:
     res = []
@@ -183,7 +209,7 @@ def _eval_compare(
 
         regimes = row.get("regimes", {}) or {}
         for regime, by_method in regimes.items():
-            for method in METHODS:
+            for method in methods:
                 payload = (by_method or {}).get(method, {}) or {}
                 pred_answer = str(payload.get("answer", "") or "")
                 gold_answer = str(gold.get("answer", "") or "")
@@ -321,6 +347,22 @@ def _build_summary(rows: list[dict]) -> dict:
     }
 
 
+def _dedup_compare_eval_rows(rows: list[dict]) -> list[dict]:
+    """Keep the latest row for each qid+regime+method to avoid incremental duplicates."""
+    dedup: dict[tuple[str, str, str], dict] = {}
+    ordered_keys: list[tuple[str, str, str]] = []
+    for row in rows:
+        key = (
+            str(row.get("qid", "")),
+            str(row.get("regime", "")),
+            str(row.get("method", "")),
+        )
+        if key not in dedup:
+            ordered_keys.append(key)
+        dedup[key] = row
+    return [dedup[k] for k in ordered_keys]
+
+
 def _plot_metric_bar(
     df: pd.DataFrame,
     metric: str,
@@ -433,15 +475,19 @@ def run_eval(
         else {}
     )
 
-    has_compare_layout = bool(pred_rows) and isinstance(pred_rows[0], dict) and "regimes" in pred_rows[0]
+    has_compare_layout = any(isinstance(x, dict) and _has_compare_layout(x) for x in pred_rows)
     if has_compare_layout:
+        methods = _detect_compare_methods(pred_rows)
         rows = _eval_compare(
             pred_rows,
             gold_map,
             include_evidence=include_evidence,
+            methods=methods,
             community_chunk_map=community_chunk_map,
         )
+        rows = _dedup_compare_eval_rows(rows)
     else:
+        methods = ("legacy",)
         rows = _eval_legacy(pred_rows, gold_map)
 
     out_csv_path = Path(out_csv)
@@ -455,6 +501,7 @@ def run_eval(
         "num_pred_rows": len(pred_rows),
         "num_gold_rows": len(gold_rows),
         "mode": "compare" if has_compare_layout else "legacy",
+        "methods": list(methods),
         "expand_community_chunks": bool(expand_community_chunks),
         "community_chunk_map_size": len(community_chunk_map),
         "summary": _build_summary(rows),

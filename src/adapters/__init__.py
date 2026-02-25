@@ -4,4 +4,5 @@ __all__ = [
     "youtu_client",
     "youtu_dataset_sync",
     "youtu_graph_state",
+    "youtu_schema_adapter",
 ]
