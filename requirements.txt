@@ -13,8 +13,28 @@ faiss-cpu
 requests
 python-dotenv
 openai
+appdirs
+datasets
+langchain-core
+langchain-openai
+langchain-community
+instructor
+rapidfuzz
 python-igraph
 leidenalg
+tiktoken
+
+# LightRAG Core (for comparison pipeline integration, no server deps)
+aiohttp
+google-api-core
+google-genai
+json_repair
+nano-vectordb
+packaging
+pipmaster
+pydantic
+pypinyin
+xlsxwriter
 
 # 可选：本地推理
 vllm

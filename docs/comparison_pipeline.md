@@ -1,308 +1,675 @@
-# VectorRAG / KG-RAG / GraphRAG 对比流程说明
+# 对比 Pipeline（重构版）
 
-## 1. 目标
+## 1. 文档目标
 
-本项目统一比较三种方法在同一查询集上的表现：
+本文档定义当前项目的统一对比流程，用于稳定复现以下目标：
 
-- VectorRAG
-- KG-RAG
-- GraphRAG
+1. 多方法统一对比：`VectorRAG / KG-RAG / GraphRAG / youtu-GraphRAG`
+   - 可选扩展：`LightRAG`
+2. 双回答策略：`reject / open`
+3. 双 Top-K 评估：`Top10 / Top20`
+4. 成本统计：`Tokens / Time`
+5. 最终产物：
+   - 表格：`Method | Dataset | Mode | Top20 | Top10 | Tokens | Time`
+   - Pareto 图：`Tokens vs Accuracy`
 
-比较维度包括：答案质量、证据可追溯性、token 消耗、调用次数、延迟。
+如需只比较 `youtu-GraphRAG` 与 `LightRAG`，请使用独立流程文档：
 
-## 2. 从零到产出对比结果（端到端流程）
+- `docs/comparison_pipeline_youtu_lightrag.md`
 
-下面按“**从零开始**（无 processed/index/graph 产物）”的顺序梳理。你也可以跳过已完成的步骤。
+---
 
-### 2.1 环境与配置
+## 2. 统一评估口径（必须遵守）
 
-1) 安装依赖：
+### 2.1 回答策略（Mode）
+
+- `reject`：证据不足返回 `NOT_FOUND`
+- `open`：证据不足允许外部知识补全（提示词要求前缀 `OUTSIDE_EVIDENCE:`）
+
+### 2.2 TopK Accuracy 定义
+
+统一使用：
+
+`TopK_Accuracy = mean( I[answer_correct = 1 AND support_at_k = 1] )`
+
+其中：
+
+- `support_at_k`：`evidence_recall_primary > 0` 记为 1，否则 0
+- 当前默认主召回口径：`evidence_recall_chunks`
+- `answer_correct`：优先 `answer_semantic_yesno`（启用 Judge 时），否则 `answer_exact_relaxed`
+
+明细列：
+
+- `topk_support`
+- `topk_correct`
+- `topk_accuracy`
+
+### 2.3 global_summary 主分口径
+
+`run_eval.py` 的 `global_summary` 复合主分为：
+
+- `composite(summary_semantic_similarity, evidence_recall_primary)`
+
+### 2.4 多模式/多 Top-K 去重口径
+
+去重键包含：
+
+- `qid + regime + method + mode + top_k`
+
+### 2.5 CUAD 检索作用域（新增）
+
+- `run_compare.py` / `run_compare_topk_modes.py` 新增 `--cuad-doc-scope true|false`
+- 默认 `false`：不做 CUAD 单文档过滤（全库检索）
+- 若设为 `true`，`strict_doc_scope` 才会生效（控制文档过滤失败时是否回退全库）
+
+---
+
+## 3. 依赖与前置条件
+
+1. 安装依赖：
 
 ```bash
 pip install -r requirements.txt
 ```
 
-2) 配置密钥（推荐写到项目根目录 `.env` 或导出环境变量）：
+2. 配置环境变量（或 `.env`）：
 
-- LLM：`LLM_API_KEY`（或 `DASHSCOPE_API_KEY`）
-- Embedding：`EMB_API_KEY`（或 `DASHSCOPE_API_KEY`）
+- `LLM_API_KEY`（或 `DASHSCOPE_API_KEY`）
+- `EMB_API_KEY`（或 `DASHSCOPE_API_KEY`）
 
-3) 关键配置：
+3. 关键配置文件：
 
-- `config.yaml`（`llm.*`, `embedding.*`, `retrieval.*`, `comparison.*`）
-- `config_budget.yaml`（`budget_matched` 的统一预算与 method-aware 预算）
+- `config.yaml`
+- `config_budget.yaml`
 
-### 2.2 准备原始数据（Raw）
+---
 
-把 Enron 数据放到 `data/raw/enron/`，支持两种形式：
+## 4. run_compare 前的数据准备（必需）
 
-- `data/raw/enron/emails.csv`（优先）
-- 或者目录下大量 `.txt`
+`run_compare.py` 依赖以下输入资产，缺一不可：
 
-### 2.3 生成 docs（Raw → docs.jsonl）
+- `queries_file`（问题集）
+- `chunks_file`
+- `idx_file`（FAISS）
+- `store_file`（chunk store）
+- `triples_file`
+- `graph_file`
+- `communities_file`
+- `gold_file`（用于 run_eval）
+
+下面给出推荐的标准准备流程。
+
+### 4.0 步骤-产物速查
+
+1. `load_docs.py`：
+   - 产物：`data/processed/*_docs.jsonl`
+2. `sample_dedup.py`（可选）：
+   - 产物：`data/processed/*_docs_sampled.jsonl`
+   - 可选产物：`outputs/results/*_sample_stats.json`（`--stats-output` 指定）
+3. `run_baselines.py --mode build_only`：
+   - 产物：`data/processed/*_chunks.jsonl`
+   - 产物：`outputs/indexes/faiss*.idx`
+   - 产物：`outputs/indexes/chunk_store*.json`
+4. `extract_triples.py / build_graph.py / build_communities.py`：
+   - 产物：`outputs/graph/*_triples*.jsonl`
+   - 产物：`outputs/graph/*_graph*.json`
+   - 产物：`outputs/graph/*_communities*.json`
+5. QA 构建：
+   - 产物：`data/queries/*_queries*.jsonl`
+   - 产物：`data/queries/*_gold*.jsonl`
+6. compare + eval：
+   - 产物：`outputs/results/compare_answers_*.jsonl`
+   - 产物：`outputs/results/compare_metrics_*.json`
+   - 产物：`outputs/results/eval_*.csv`
+   - 产物：`outputs/results/eval_*_summary.json`
+   - 产物：`outputs/results/topk_mode_summary.{csv,md,json}`
+7. report 导出：
+   - 产物：`outputs/results/final_report.{csv,md}`
+   - 产物：`outputs/results/pareto_frontier.png`
+
+### 4.1 Raw -> docs.jsonl
+
+#### Enron
 
 ```bash
-python src/ingestion/load_docs.py
+python src/ingestion/load_docs.py \
+  --dataset enron \
+  --raw-dir data/raw/enron \
+  --out-file data/processed/enron_docs.jsonl
 ```
 
-产物：`data/processed/enron_docs.jsonl`
+本步产物：
 
-（可选）去重 + 抽样（更利于快速实验）：
+- `data/processed/enron_docs.jsonl`
+
+#### CUAD
 
 ```bash
-python src/ingestion/sample_dedup.py --sample-size 2000
+python src/ingestion/load_docs.py \
+  --dataset cuad \
+  --raw-file data/raw/cuad/test.json \
+  --out-file data/processed/cuad_docs.jsonl \
+  --split-name test
 ```
 
-产物：`data/processed/enron_docs_sampled.jsonl`
+本步产物：
 
-### 2.4 分块 + 建向量索引（docs → chunks → FAISS）
+- `data/processed/cuad_docs.jsonl`
 
-推荐直接用 `run_baselines.py` 的 build-only 模式（它会用 chunk_size=1600, overlap=200，并构建 FAISS 索引）：
+#### CUAD（可选：按 QA 文档集合对齐 docs）
+
+当评测问题集来自 `data/queries/cuad_capability_queries.jsonl`
+这类“只覆盖部分 CUAD 文档”的 QA 子集时，推荐先从
+`data/raw/cuad/CUADv1.json` 反筛一份与 QA 文档集合对齐的 `docs.jsonl`，
+再继续自行切 chunk 和构图。这样可以避免“QA 所属文档不在图库中”导致的检索失配。
+
+下面的命令会：
+
+- 读取 `CUADv1.json` 全量文档
+- 从 QA 文件中提取 `meta.query_doc_key`（缺失时回退 `meta.title`）
+- 保留全部与 QA 对应的文档
+- 再按 `--matched-doc-ratio` 补采不对应文档
+- 输出与 `load_cuad()` 相同格式的 `docs.jsonl`
+
+示例：输出文档集中约 `10%` 为 QA 对应文档，`90%` 为其他文档：
 
 ```bash
-python src/experiments/run_baselines.py --mode build_only
+python src/ingestion/build_cuad_aligned_docs.py \
+  --cuad-file data/raw/cuad/CUADv1.json \
+  --qa-file data/queries/cuad_converted_queries_generated.jsonl \
+  --out-docs-file data/processed/cuad_docs_capability_aligned.jsonl \
+  --matched-doc-ratio 0.3 \
+  --random-seed 42 \
+  --split-name capability_aligned
 ```
 
-根据你是否存在 `enron_docs_sampled.jsonl`，它会走两条路径之一：
+本步产物：
 
-- **sampled 路径（默认优先）**：
-  - `data/processed/chunks_sampled.jsonl`
-  - `outputs/indexes/faiss_sampled.idx`
-  - `outputs/indexes/chunk_store_sampled.json`
-- **full 路径**（无 sampled docs 时）：
-  - `data/processed/chunks.jsonl`
-  - `outputs/indexes/faiss.idx`
-  - `outputs/indexes/chunk_store.json`
+- `data/processed/cuad_docs_capability_aligned.jsonl`
 
-> 注意：对比实验的 `--chunks-file/--idx-file/--store-file` 需要保持同一套（sampled 或 full），否则证据映射会错位。
+说明：
 
-### 2.5 构建共享图资产（chunks → triples → graph → communities）
+- `--matched-doc-ratio` 表示输出文档集中“与 QA 对应文档”的目标占比。
+- 当前实现会保留全部 matched 文档，再按比例补采 unmatched 文档；若 unmatched 不足，则按可用数量补齐，并在脚本输出统计中给出实际比例。
+- 后续若使用该产物继续构图，请将后面的 chunk 构建输入切换为这份新 docs 文件。
 
-对比入口会在图资产缺失时自动构建（见 2.6）。你也可以手动分步执行：
+### 4.2（可选）去重与抽样
 
 ```bash
-# 1) LLM 三元组抽取（推荐批量模式降低调用次数）
+python src/ingestion/sample_dedup.py \
+  --input data/processed/enron_docs.jsonl \
+  --output data/processed/enron_docs_sampled.jsonl \
+  --sample-size 2000 \
+  --stats-output outputs/results/enron_sample_stats.json
+```
+
+本步产物：
+
+- `data/processed/enron_docs_sampled.jsonl`
+- `outputs/results/enron_sample_stats.json`（若传 `--stats-output`）
+
+### 4.3 docs -> chunks + index/store
+
+推荐使用 `run_baselines.py --mode build_only` 快速构建：
+
+#### CUAD
+
+```bash
+python src/experiments/run_baselines.py \
+  --dataset cuad \
+  --mode build_only \
+  --cuad-raw-file data/processed/qa_aligned_docs.jsonl \
+  --cuad-split-name test
+```
+
+本步产物（CUAD）：
+
+- `data/processed/cuad_chunks.jsonl`
+- `outputs/indexes/faiss_cuad.idx`
+- `outputs/indexes/chunk_store_cuad.json`
+
+#### Enron
+
+```bash
+python src/experiments/run_baselines.py \
+  --dataset enron \
+  --mode build_only
+```
+
+本步产物（Enron）：
+
+- `data/processed/chunks_sampled.jsonl`（或 `chunks.jsonl`）
+- `outputs/indexes/faiss_sampled.idx`（或 `faiss.idx`）
+- `outputs/indexes/chunk_store_sampled.json`（或 `chunk_store.json`）
+
+### 4.4 chunks -> triples -> graph -> communities
+
+```bash
 python src/graph_build/extract_triples.py \
-  --chunks-file data/processed/chunks_sampled.jsonl \
-  --out-file outputs/graph/triples.jsonl \
+  --chunks-file data/processed/cuad_chunks.jsonl \
+  --out-file outputs/graph/cuad_triples_test.jsonl \
   --mode batched \
-  --batch-size 4 \
-  --concurrency 4 \
-  --schema-file config_triple_schema.json \
-  --min-chars 80 \
+  --batch-size 5 \
+  --concurrency 10 \
+  --schema-file config_triple_schema_cuad_core_v2.json \
+  --schema-apply-mode strict \
   --progress-every 50
 
-# 2) triples → graph.json（带 edge_id/mentions/weight）
 python src/graph_build/build_graph.py \
-  --triples-file outputs/graph/triples.jsonl \
-  --out-file outputs/graph/graph.json
+  --triples-file outputs/graph/cuad_triples_test.jsonl \
+  --out-file outputs/graph/cuad_graph_test.json \
+  --edge-merge-mode global \
+  --node-merge-mode normalized \
+  --node-scope-with-type true
 
-# 3) Leiden 社区划分（含层级）+ 社区摘要（GraphRAG 用）
 python src/graph_build/build_communities.py \
-  --graph-file outputs/graph/graph.json \
-  --out-file outputs/graph/communities.json \
+  --graph-file outputs/graph/cuad_graph_test.json \
+  --out-file outputs/graph/cuad_communities_test.json \
   --resolutions 0.6,1.0,1.6 \
+  --min-parent-overlap 0.8 \
   --summary-level-max 1 \
   --summary-min-size 15 \
-  --summary-top-per-level 200
+  --summary-top-per-level 200 \
+  --summary-min-per-level 10
 ```
 
-这三步现在都带实时进度日志：
+本步产物：
 
-- `extract_triples.py`：按 chunk 周期输出（可用 `--progress-every` 调整频率），支持 `--mode batched` + `--concurrency` 降低耗时，支持 `--schema-file` 约束实体类型与关系集合
-- `build_graph.py`：输出输入规模、去重边数、节点数、完成状态
-- `build_communities.py`：输出 Leiden 各层进度、摘要策略与摘要完成计数（支持只预摘要高层/大社区）
+- `outputs/graph/cuad_triples_test.jsonl`
+- `outputs/graph/cuad_graph_test.json`
+- `outputs/graph/cuad_communities_test.json`
 
-其中 `build_communities.py` 输出：
+### 4.5 构建 queries/gold
 
-- `algorithm=leiden`
-- `is_hierarchical=true`
-- `levels`（每层社区列表，coarse→fine）
-- `communities`（每个社区包含 `level/parent_id/children_ids/summary`）
+#### 方案 A：CUAD 能力导向（推荐做方法对比）
 
-### 2.6 构建 Gold QA 与 Query 集（QA Builder）
+```bash
+python src/evaluation/build_cuad_capability_qa.py \
+  --graph-file outputs/graph/cuad_graph_test.json \
+  --communities-file outputs/graph/cuad_communities_test.json \
+  --queries-out data/queries/cuad_capability_queries.jsonl \
+  --gold-out data/queries/cuad_capability_gold.jsonl \
+  --per-type 20 \
+  --random-seed 42 \
+  --question-style llm \
+  --llm-question-model deepseek-chat \
+  --llm-question-temperature 0 \
+  --llm-cross-generate-qa \
+  --llm-cross-answer-max-tokens 200 \
+  --llm-question-max-tokens 200 \
+  --progress-every 1
+```
 
-先确保图资产和 chunk store 已准备完成（见 2.4/2.5），再执行：
+本步产物：
+
+- `data/queries/cuad_capability_queries.jsonl`
+- `data/queries/cuad_capability_gold.jsonl`
+
+#### 方案 B：CUAD 模板转换为三类 QA（按总量采样）
+
+当你希望直接从 `data/raw/cuad/train_separate_questions.json` 生成三类题
+（`local_factual / cross_clause / global_summary`）时，使用：
+
+```bash
+python src/evaluation/build_cuad_question_converter.py \
+  --cuad-train-file data/raw/cuad/train_separate_questions.json \
+  --mode llm \
+  --llm-types global_synthesis \
+  --total-per-type 50 \
+  --answer-mode weak_reference \
+  --type-name-scheme capability \
+  --progress-every-qa 20 \
+  --out-queries-file data/queries/cuad_converted_queries_generated.jsonl \
+  --out-gold-file data/queries/cuad_converted_gold_generated.jsonl
+```
+
+说明：
+
+- `--total-per-type`：全局每类总题数（随机采样文档生成），不是“每文档数量”。
+- `--llm-types global_synthesis`：仅 global 走 LLM；local/cross 使用规则模板。
+- `--answer-mode weak_reference`：输出弱参考答案；如需占位答案可改为 `placeholder`。
+- `--type-name-scheme capability`：输出类型名对齐现有评测：`local_factual/cross_clause/global_summary`。
+- `--progress-every-qa`：按已生成 QA 数量打印进度日志（`[qa_progress] ...`）。
+
+本步产物（方案 B）：
+
+- `data/queries/cuad_converted_queries_generated.jsonl`
+- `data/queries/cuad_converted_gold_generated.jsonl`
+
+说明：
+
+- `--question-style llm` 启用 LLM 生成自然问句；生成失败会自动回退模板问句。
+- `--llm-cross-generate-qa` 启用 `cross_clause` 的 LLM 问题+答案联合生成；失败会回退规则答案。
+- 如需纯模板问句，改为 `--question-style template`（默认值）。
+
+可选：使用 LLM 基于 `supporting_chunks` 重写 `global_summary` 的 gold 答案
+
+```bash
+python src/evaluation/rewrite_global_summary_gold.py \
+  --gold-file data/queries/cuad_capability_gold.jsonl \
+  --chunks-file data/processed/cuad_chunks.jsonl \
+  --out-file data/queries/cuad_capability_gold_docsummary.jsonl \
+  --max-chunks 8 \
+  --max-chunk-chars 2200 \
+  --max-completion-tokens 320 \
+  --progress-every 1
+```
+
+本步产物：
+
+- `data/queries/cuad_capability_gold_docsummary.jsonl`
+
+说明：
+
+- 该步骤仅重写 `type=global_summary` 的答案，其它类型保持不变。
+- 执行评测时，将 `--gold-file` 切换为 `data/queries/cuad_capability_gold_docsummary.jsonl`。
+
+#### 方案 C：CUAD 原生问法
+
+```bash
+python src/ingestion/build_cuad_qa.py \
+  --raw-file data/raw/cuad/test.json \
+  --queries-out data/queries/cuad_queries_test.jsonl \
+  --gold-out data/queries/cuad_gold_test.jsonl \
+  --split-name test \
+  --store-file outputs/indexes/chunk_store_cuad.json
+```
+
+本步产物：
+
+- `data/queries/cuad_queries_test.jsonl`
+- `data/queries/cuad_gold_test.jsonl`
+
+#### 方案 C：Enron 对齐 QA
 
 ```bash
 python src/evaluation/qa_builder.py \
   --graph-file outputs/graph/graph.json \
   --communities-file outputs/graph/communities.json \
   --chunk-store-file outputs/indexes/chunk_store_sampled.json \
-  --out-gold data/queries/gold_qa.jsonl \
-  --out-queries data/queries/queries.jsonl \
-  --out-gold-answer data/queries/gold.jsonl \
+  --out-gold data/queries/gold_qa_aligned.jsonl \
+  --out-queries data/queries/queries_aligned.jsonl \
+  --out-gold-answer data/queries/gold_aligned.jsonl \
   --n_local 20 \
-  --n_cross 15 \
-  --n_global 15 \
-  --n_trace 10 \
-  --qa-community-level 0
+  --n_cross 20 \
+  --n_global 20 \
+  --n_trace 20
 ```
 
-产物：
+本步产物：
 
-- `data/queries/gold_qa.jsonl`：完整 gold QA（answer + supporting_chunks/edges/communities）
-- `data/queries/queries.jsonl`：仅 `qid/type/query`，可直接喂 `run_compare.py`
-- `data/queries/gold.jsonl`：仅 `qid/answer`，可用于 `src/evaluation/run_eval.py` 的 answer-only 评估模式
+- `data/queries/queries_aligned.jsonl`
+- `data/queries/gold_qa_aligned.jsonl`
+- `data/queries/gold_aligned.jsonl`
 
-QA Builder 不调用 LLM，采用规则化构造（边、路径、社区摘要）并做证据对齐校验。
+---
 
-### 2.7 运行三方法对比（同一 queries）
+## 5. 最小复现（已有资产时）
+
+如果第 4 章资产已齐全，可直接执行：
+
+### 5.1 一键跑 Top10/Top20 × reject/open
+
+```bash
+python src/experiments/run_compare_topk_modes.py \
+  --queries-file data/queries/cuad_capability_queries.jsonl \
+  --gold-file data/queries/cuad_capability_gold_docsummary.jsonl \
+  --chunks-file data/processed/cuad_chunks.jsonl \
+  --idx-file outputs/indexes/faiss_cuad.idx \
+  --store-file outputs/indexes/chunk_store_cuad.json \
+  --triples-file outputs/graph/cuad_triples_test.jsonl \
+  --graph-file outputs/graph/cuad_graph_test.json \
+  --communities-file outputs/graph/cuad_communities_test.json \
+  --topk-list 10 \
+  --answer-modes reject \
+  --regime best_effort \
+  --cuad-doc-scope false \
+  --strict-doc-scope false \
+  --judge-mode llm_yesno \
+  --judge-model deepseek-chat \
+  --method-mode all \
+  --include-lightrag \
+  --include-youtu \
+  --youtu-client-id web_client \
+  --youtu-dataset cuad \
+  --youtu-corpus-source-file data/processed/cuad_chunks.jsonl \
+  --youtu-sync-mode none \
+  --youtu-force-rebuild false \
+  --youtu-require-fingerprint-match false \
+  --youtu-graph-state-file outputs/graph/youtu_graph_state_cuad.json \
+  --max-queries 10
+```
+
+本步产物（每个 `topk × mode` 组合各一套）：
+
+- `outputs/results/compare_answers_top{K}_{mode}.jsonl`
+- `outputs/results/compare_metrics_top{K}_{mode}.json`
+- `outputs/results/eval_top{K}_{mode}.csv`
+- `outputs/results/eval_top{K}_{mode}_summary.json`
+
+本步汇总产物：
+
+- `outputs/results/topk_mode_summary.csv`
+- `outputs/results/topk_mode_summary.md`
+- `outputs/results/topk_mode_summary.json`
+
+### 5.2 导出最终报告 + Pareto
+
+```bash
+python src/evaluation/export_report.py \
+  --in-csv outputs/results/topk_mode_summary.csv \
+  --out-csv outputs/results/final_report.csv \
+  --out-md outputs/results/final_report.md \
+  --pareto-out outputs/results/pareto_frontier.png \
+  --accuracy-col top10_accuracy
+```
+
+本步产物：
+
+- `outputs/results/final_report.csv`
+- `outputs/results/final_report.md`
+- `outputs/results/pareto_frontier.png`
+
+---
+
+## 6. 分步执行（调试用）
+
+### 6.1 单次 compare（单模式）
 
 ```bash
 python src/experiments/run_compare.py \
-  --queries-file data/queries/gold_qa.jsonl \
-  --chunks-file data/processed/chunks_sampled.jsonl \
-  --idx-file outputs/indexes/faiss_sampled.idx \
-  --store-file outputs/indexes/chunk_store_sampled.json \
-  --triples-file outputs/graph/triples.jsonl \
-  --graph-file outputs/graph/graph.json \
-  --communities-file outputs/graph/communities.json \
-  --regimes both \
-  --budget-config-file config_budget.yaml \
-  --out-file outputs/results/compare_answers.jsonl \
-  --metrics-file outputs/results/compare_metrics.json
+  --queries-file data/queries/cuad_capability_queries.jsonl \
+  --chunks-file data/processed/cuad_chunks.jsonl \
+  --idx-file outputs/indexes/faiss_cuad.idx \
+  --store-file outputs/indexes/chunk_store_cuad.json \
+  --triples-file outputs/graph/cuad_triples_test.jsonl \
+  --graph-file outputs/graph/cuad_graph_test.json \
+  --communities-file outputs/graph/cuad_communities_test.json \
+  --top-k 20 \
+  --answer-mode reject \
+  --cuad-doc-scope false \
+  --strict-doc-scope false \
+  --include-lightrag \
+  --include-youtu \
+  --youtu-client-id web_client \
+  --youtu-route-type local \
+  --youtu-corpus-source-file data/processed/cuad_chunks.jsonl \
+  --youtu-sync-mode shared_dir \
+  --youtu-force-rebuild true \
+  --youtu-require-fingerprint-match false \
+  --out-file outputs/results/compare_answers_top10_reject.jsonl \
+  --metrics-file outputs/results/compare_metrics_top10_reject.json \
+  --max-queries 10
 ```
 
-说明：
+本步产物：
 
-- `run_compare.py` 当前预算相关 CLI 只保留 `--budget-config-file`
-- `budget_matched` 预算与方法约束从 `config_budget.yaml` 读取
-- 运行中会打印状态日志（query/regime/method 进度）
+- `outputs/results/compare_answers_top10_reject.jsonl`
+- `outputs/results/compare_metrics_top10_reject.json`
 
-产物：
+### 6.2 单次 compare（双模式）
 
-- `outputs/results/compare_answers.jsonl`：每个 query 在 `best_effort` 与 `budget_matched` 两种 regime 下的三方法答案、证据、预算检查与明细 telemetry
-- `outputs/results/compare_metrics.json`：分 regime 聚合指标（调用次数、token、延迟 p50/p95）、按 `type` 分层指标、图与索引构建成本
+```bash
+python src/experiments/run_compare.py \
+  --queries-file data/queries/cuad_capability_queries.jsonl \
+  --chunks-file data/processed/cuad_chunks.jsonl \
+  --idx-file outputs/indexes/faiss_cuad.idx \
+  --store-file outputs/indexes/chunk_store_cuad.json \
+  --triples-file outputs/graph/cuad_triples_test.jsonl \
+  --graph-file outputs/graph/cuad_graph_test.json \
+  --communities-file outputs/graph/cuad_communities_test.json \
+  --top-k 10 \
+  --answer-modes reject,open \
+  --cuad-doc-scope false \
+  --strict-doc-scope false \
+  --include-lightrag \
+  --include-youtu \
+  --youtu-client-id web_client \
+  --youtu-route-type local \
+  --youtu-corpus-source-file data/processed/cuad_chunks.jsonl \
+  --youtu-sync-mode none \
+  --youtu-force-rebuild false \
+  --youtu-require-fingerprint-match false \
+  --out-file outputs/results/compare_answers_top10_both_modes.jsonl \
+  --metrics-file outputs/results/compare_metrics_top10_both_modes.json
+```
 
-### 2.8 （可选）快速跑通建议
+本步产物：
 
-LLM 三元组抽取是最耗时/最贵的一步。建议先用更小的 chunks 集（例如仓库已有 `data/processed/chunks_sampled_1000.jsonl`）跑通流程：
+- `outputs/results/compare_answers_top10_both_modes.jsonl`
+- `outputs/results/compare_metrics_top10_both_modes.json`
 
-- 先用该 chunks 建索引（需保证 index 与 chunks 对齐）
-- 对比脚本的 `--chunks-file/--idx-file/--store-file` 全部切换到同一套“小样本”文件
-
-### 2.9 评估对比结果（run_eval）
-
-推荐使用完整 gold（含证据）评估：
+### 6.3 run_eval
 
 ```bash
 python src/evaluation/run_eval.py \
-  --pred-file outputs/results/compare_answers.jsonl \
-  --gold-file data/queries/gold_qa.jsonl \
-  --out-csv outputs/results/eval_compare.csv \
-  --out-summary outputs/results/eval_compare_summary.json
+  --pred-file outputs/results/compare_answers_top10_reject.jsonl \
+  --gold-file data/queries/cuad_capability_gold.jsonl \
+  --out-csv outputs/results/eval_top10_reject.csv \
+  --out-summary outputs/results/eval_top10_reject_summary.json \
+  --judge-mode llm_yesno \
+  --judge-model deepseek-chat
 ```
 
-产物：
+本步产物：
 
-- `outputs/results/eval_compare.csv`：逐条 `qid × regime × method` 明细（答案相似度 + 证据匹配 + budget 状态）
-- `outputs/results/eval_compare_summary.json`：按 `regime × method` 与 `type` 聚合统计
+- `outputs/results/eval_top10_reject.csv`
+- `outputs/results/eval_top10_reject_summary.json`
 
-若仅做答案文本评估（不含证据指标），可改用：
+可选：
 
-```bash
-python src/evaluation/run_eval.py \
-  --pred-file outputs/results/compare_answers.jsonl \
-  --gold-file data/queries/gold.jsonl \
-  --out-csv outputs/results/eval_compare_answer_only.csv \
-  --out-summary outputs/results/eval_compare_answer_only_summary.json
+- `--method-mode all|exclude_youtu|only_youtu`
+- `--disable-semantic-similarity`
+- `--global-summary-primary-mode semantic|composite`
+
+---
+
+## 7. 输出文件说明
+
+### 7.1 compare
+
+- `compare_answers*.jsonl`：逐 query（含 `mode`、`top_k`）
+- `compare_metrics*.json`：聚合（含 `answer_mode` / `answer_modes`）
+
+### 7.2 eval
+
+- `eval_*.csv`：明细
+- `eval_*_summary.json`：汇总
+
+关键列：
+
+- 匹配：`answer_exact_relaxed`, `answer_semantic_yesno`
+- 支持：`evidence_recall_primary`, `evidence_recall_chunks`, `evidence_recall_docs`, `topk_support`, `topk_correct`, `topk_accuracy`
+- 成本：`total_tokens`, `latency_ms_total`
+- 维度：`regime`, `method`, `mode`, `top_k`, `type`
+
+### 7.3 topk 汇总
+
+- `outputs/results/topk_mode_summary.csv`
+- `outputs/results/topk_mode_summary.md`
+- `outputs/results/topk_mode_summary.json`
+
+核心列：
+
+- `method, dataset, mode, top10_accuracy, top20_accuracy, tokens, time`
+
+### 7.4 最终报告
+
+- `outputs/results/final_report.csv`
+- `outputs/results/final_report.md`
+- `outputs/results/pareto_frontier.png`
+
+---
+
+## 8. 配置治理建议
+
+`config.yaml` 建议维护 `evaluation` 段：
+
+```yaml
+evaluation:
+  answer_modes: ["reject", "open"]
+  topk_list: [10, 20]
+  include_youtu: true
+  method_mode: all
+  judge:
+    enabled: false
+    model: qwen-flash
 ```
 
-### 2.10 图结构指标统计（Graph Structure Metrics）
+建议每次实验显式记录：
 
-运行：
+- `answer_mode(s)`
+- `top_k / topk_list`
+- `judge_mode / judge_model`
+- `include_youtu / method_mode`
 
-```bash
-python src/evaluation/graph_structure_metrics.py \
-  --graph-file outputs/graph/graph.json \
-  --communities-file outputs/graph/communities.json \
-  --out-json outputs/results/graph_structure_metrics.json \
-  --out-dir outputs/results/graph_plots
-```
+---
 
-必含指标：
+## 9. youtu 对齐说明
 
-- 平均度（`average_degree`）
-- 最大连通分量比例（`largest_connected_component_ratio`）
-- 聚类系数（`clustering_coefficient_global` / `clustering_coefficient_avg_local`）
-- 边权重分布统计（`weight_stats`）
-- 度为 1 的节点比例（`degree_one_ratio`）
+开启 youtu 分支后，方法 payload 额外包含：
 
-图表输出：
+- `answer_mode_requested`
+- `answer_mode`（effective）
+- `answer_mode_backend_supported`
 
-- 社区规模分布直方图：`outputs/results/graph_plots/community_size_distribution.png`
-- weight 分布直方图：`outputs/results/graph_plots/edge_weight_distribution.png`
+用于区分“请求模式”和“后端实际支持状态”。
 
-说明：
+当前 `ask-question` 为异步两段式：
 
-- `run_compare.py` 在写 `compare_metrics.json` 时会自动尝试计算该指标，并写入 `graph_structure_metrics` 字段（失败不阻塞主流程）。
+1. `POST /api/ask-question` 提交任务，返回 `task_id` 与 `status=queued|running`。
+2. `GET /api/ask-question/{task_id}` 轮询任务，`status=completed` 时答案在 `data` 字段。
 
-## 3. 统一数据流（概念视图）
+推荐同时显式传入以下参数：
 
-1) `data/processed/chunks*.jsonl` 生成后，VectorRAG 构建向量索引（FAISS）。
-2) 同一份 `chunks` 使用 LLM 进行三元组抽取，产出共享图资产：
-   - `outputs/graph/triples.jsonl`
-   - `outputs/graph/graph.json`
-   - `outputs/graph/communities.json`
-3) 对 `data/queries/queries.jsonl` 的每条 query，在两种 regime 下同时运行：
-   - `best_effort`：各方法完整能力上限
-   - `budget_matched`：统一 query-time 预算（token/calls）约束
-4) 每个 regime 下运行：
-   - VectorRAG（FAISS 检索）
-   - KG-RAG（entity linking + 1~3 hop traversal + chunk 原文回填）
-   - GraphRAG（社区摘要 map-reduce，query-time 不遍历 triples）
-5) 统一输出到：
-   - `outputs/results/compare_answers.jsonl`
-   - `outputs/results/compare_metrics.json`
+- `--youtu-client-id web_client`（对应 `POST /api/ask-question?client_id=...`）
+- `--youtu-route-type <backend定义值>`（如 `local|structural|global`，以及后端支持的别名）
 
-## 4. 关键实现模块
+为避免误触发后端重构图，建议默认使用：
 
-- 统一对比入口：`src/experiments/run_compare.py`
-- VectorRAG 证据化检索：`src/baselines/vector_rag.py` (`retrieve_with_evidence`)
-- KG-RAG：`src/baselines/kg_rag.py`
-- GraphRAG：`src/baselines/graph_rag.py`
-- 共享图构建：
-  - `src/graph_build/extract_triples.py`（LLM 抽取）
-  - `src/graph_build/build_graph.py`
-  - `src/graph_build/build_communities.py`（Leiden + hierarchy）
-- 统计工具：
-  - `src/utils/telemetry.py`
-  - `src/utils/llm_wrapper.py`（usage/latency 回传）
-  - `src/utils/embedder.py`（embedding usage/latency 回传）
-  - `src/utils/tokenizer.py`（统一 token 计数）
-  - `src/utils/budget.py`（BudgetManager）
-- QA 构建：
-  - `src/evaluation/qa_builder.py`
+- `--youtu-corpus-source-file data/processed/cuad_chunks.jsonl`
+- `--youtu-sync-mode none`
+- `--youtu-force-rebuild false`
+- `--youtu-require-fingerprint-match false`
 
-## 5. 输出格式（核心字段）
+---
 
-`compare_answers.jsonl` 每条记录包含：
+## 10. 常见问题
 
-- `qid`, `type`, `query`
-- `regimes.best_effort.vector_rag / kg_rag / graph_rag`
-- `regimes.budget_matched.vector_rag / kg_rag / graph_rag`
-- `budget_matched` 下每方法附带 `budget_check`（含 manager/error）
-- GraphRAG 若触发预算收缩，会包含 `budget_adaptation`
+1. 结果被覆盖：确认使用包含 `mode/top_k` 去重的新版评估流程。
+2. TopK Accuracy 偏低：先看 `evidence_recall_primary`（默认 chunks 口径），再看 `answer_correct` 来源。
+3. global_summary 分数异常：确认使用 `composite(summary_semantic_similarity, evidence_recall_primary)`。
+4. token 统计为 0：通常是 API 未返回完整 `usage`。
+5. matplotlib 缓存告警：可设置 `export MPLCONFIGDIR=/tmp/mplcache`。
 
-`compare_metrics.json` 包含：
+---
 
-- 全部 query 数量
-- 分 regime 的三种方法聚合指标：
-  - `llm_calls`
-  - `embedding_calls`
-  - `prompt_tokens`, `completion_tokens`, `total_tokens`
-  - `llm_latency_ms`, `embedding_latency_ms`
-  - `latency_ms.p50 / p95`
-- `aggregate_metrics_by_type`：按 query `type` 分层汇总
-- `indexing_metrics`：`vector_index / triple_extract / graph_build / community_build`
+## 11. 论文产出推荐顺序
 
-## 6. 注意事项 / 常见坑
-
-- 首次运行会触发 LLM 三元组抽取和社区摘要，耗时较长。
-- 如果 API 返回不含 `usage`，token 统计会记为 0（请在论文中注明供应商返回限制）。
-- GraphRAG 当前严格采用“社区摘要 map-reduce”策略：query-time 不直接拼接 triples/edges。
-- KG-RAG 当前采用实体链接 + 多跳遍历，并使用统一 embedding 对 traversal 证据进行语义重排。
-- `budget_matched` 下 GraphRAG 默认单次执行；仅当 `comparison.budget_matched.graph.adaptive_retry=true`（或 `config_budget.yaml` 的 `budget.graph.adaptive_retry=true`）且首次超预算时，才会触发一次 adaptive shrink 重跑。
-- `run_compare.py` **不会自动构建 FAISS 索引**：请先执行 `run_baselines.py --mode build_only`，或手动用 `vector_rag.build_index(...)` 生成 `idx/store`。
-- 如果 `qa_builder.py` 输出中 `graph_chunk_mention_coverage` 很低（例如接近 0），通常是 `chunk_store` 与 `graph/triples` 不是同一套 sampled/full 资产，需重建或切换到一致文件。
+1. 固定资产（chunks/index/graph/communities）
+2. 跑 `run_compare_topk_modes.py`（Top10/Top20 × reject/open）
+3. 跑 `export_report.py` 导出最终表与 Pareto
+4. 在论文中明确：
+   - `TopK_Accuracy` 公式
+   - `answer_correct` 选择规则
+   - `support_at_k` 定义

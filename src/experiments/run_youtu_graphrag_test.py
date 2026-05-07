@@ -79,6 +79,10 @@ def _load_jsonl(path: str) -> list[dict]:
     return rows
 
 
+def _abs_path(path: str) -> str:
+    return str(Path(path).expanduser().resolve())
+
+
 def _maybe_read_json(path: str) -> dict | None:
     p = Path(path)
     if not p.exists():
@@ -276,6 +280,8 @@ def ensure_youtu_graph_assets(
     construct_timeout_sec: int,
     sync_mode: str,
     shared_corpus_dir: str,
+    triple_schema_file: str | None,
+    schema_apply_mode: str,
 ) -> dict[str, Any]:
     Path(graph_state_file).parent.mkdir(parents=True, exist_ok=True)
 
@@ -353,7 +359,10 @@ def ensure_youtu_graph_assets(
         result["youtu_artifacts"] = {"skipped": True, "reused_local": True}
         return result
 
-    youtu_client = YoutuClient(base_url=youtu_base_url, timeout_sec=120)
+    youtu_client = YoutuClient(
+        base_url=youtu_base_url,
+        timeout_sec=max(120, int(construct_timeout_sec)),
+    )
     sync_meta = sync_chunks_to_youtu_dataset(
         chunks_file=chunks_file,
         dataset=youtu_dataset,
@@ -363,9 +372,13 @@ def ensure_youtu_graph_assets(
     result["youtu_sync"] = sync_meta
 
     construct_started = time.time()
+    chunks_source_value = sync_meta.get("written_file") or sync_meta.get("chunks_source")
+    if chunks_source_value:
+        chunks_source_value = _abs_path(str(chunks_source_value))
+
     construct_kwargs = {
         "dataset_name": youtu_dataset,
-        "chunks_source": sync_meta.get("written_file") or sync_meta.get("chunks_source"),
+        "chunks_source": chunks_source_value,
         "chunks_fingerprint": decision["fingerprint"],
     }
     if youtu_schema is not None:
@@ -398,7 +411,14 @@ def ensure_youtu_graph_assets(
                 "path": "B_local_fallback",
             }
             try:
-                local_metrics = ensure_graph_assets(chunks_file, triples_file, graph_file, communities_file)
+                local_metrics = ensure_graph_assets(
+                    chunks_file,
+                    triples_file,
+                    graph_file,
+                    communities_file,
+                    triple_schema_file=triple_schema_file,
+                    schema_apply_mode=schema_apply_mode,
+                )
             except Exception as local_exc:  # noqa: BLE001
                 local_metrics = {"error": str(local_exc)}
             result["local_graph_assets"] = local_metrics
@@ -415,7 +435,7 @@ def ensure_youtu_graph_assets(
         fingerprint=decision["fingerprint"],
         build_params={
             "dataset": youtu_dataset,
-            "chunks_source": sync_meta.get("written_file") or sync_meta.get("chunks_source"),
+            "chunks_source": chunks_source_value,
             "chunks_fingerprint": decision["fingerprint"],
             "sync_mode": sync_meta.get("sync_mode", sync_mode),
             "schema_sha256": youtu_schema_meta.get("schema_sha256"),
@@ -430,6 +450,7 @@ def ensure_youtu_graph_assets(
 def run_youtu_graphrag_test(
     queries_file: str,
     chunks_file: str,
+    store_file: str,
     triples_file: str,
     graph_file: str,
     communities_file: str,
@@ -449,6 +470,8 @@ def run_youtu_graphrag_test(
     construct_timeout_sec: int,
     sync_mode: str,
     shared_corpus_dir: str,
+    triple_schema_file: str | None,
+    schema_apply_mode: str,
     max_queries: int | None,
     incremental_only: bool,
 ) -> dict[str, Any]:
@@ -478,6 +501,8 @@ def run_youtu_graphrag_test(
         construct_timeout_sec=construct_timeout_sec,
         sync_mode=sync_mode,
         shared_corpus_dir=shared_corpus_dir,
+        triple_schema_file=triple_schema_file,
+        schema_apply_mode=schema_apply_mode,
     )
     _progress("graph assets ready")
 
@@ -559,6 +584,7 @@ def run_youtu_graphrag_test(
                 query=query,
                 graph_file=graph_file,
                 communities_file=communities_file,
+                store_file=store_file,
                 max_completion_tokens=budget["max_completion_tokens"] if is_budget else None,
                 youtu_base_url=youtu_base_url,
                 youtu_dataset=youtu_dataset,
@@ -591,6 +617,7 @@ def run_youtu_graphrag_test(
                     query=query,
                     graph_file=graph_file,
                     communities_file=communities_file,
+                    store_file=store_file,
                     max_completion_tokens=budget["max_completion_tokens"],
                     youtu_base_url=youtu_base_url,
                     youtu_dataset=youtu_dataset,
@@ -744,8 +771,9 @@ def main() -> None:
     youtu = getattr(cfg, "youtu", None)
 
     parser = argparse.ArgumentParser(description="Run independent youtu-GraphRAG test pipeline")
-    parser.add_argument("--queries-file", default="data/queries/queries.jsonl")
+    parser.add_argument("--queries-file", default="data/queries/gold_qa.jsonl")
     parser.add_argument("--chunks-file", default="data/processed/chunks_sampled.jsonl")
+    parser.add_argument("--store-file", default="outputs/indexes/chunk_store_sampled.json")
     parser.add_argument("--triples-file", default="outputs/graph/triples.jsonl")
     parser.add_argument("--graph-file", default="outputs/graph/graph.json")
     parser.add_argument("--communities-file", default="outputs/graph/communities.json")
@@ -761,13 +789,23 @@ def main() -> None:
 
     parser.add_argument("--youtu-base-url", default=str(_g(youtu, "base_url", "http://127.0.0.1:8080")))
     parser.add_argument("--youtu-dataset", default=str(_g(youtu, "dataset", "enterprise")))
-    parser.add_argument("--youtu-schema-file", default=str(_g(youtu, "schema_file", "config_triple_schema.json")))
+    parser.add_argument(
+        "--youtu-schema-file",
+        default=str(_g(youtu, "schema_file", "youtu-graphrag/schemas/cuad_docs_sampled.json")),
+    )
     parser.add_argument("--export-youtu-artifacts", default="true")
     parser.add_argument("--construct-poll-sec", type=int, default=int(_g(youtu, "construct_poll_sec", 2)))
     parser.add_argument("--construct-timeout-sec", type=int, default=int(_g(youtu, "construct_timeout_sec", 1800)))
 
     parser.add_argument("--sync-mode", choices=["none", "shared_dir"], default="none")
     parser.add_argument("--shared-corpus-dir", default="outputs/youtu_sync")
+    parser.add_argument("--triple-schema-file", default="config_triple_schema.json")
+    parser.add_argument(
+        "--schema-apply-mode",
+        choices=["strict", "prompt_only", "disabled"],
+        default="strict",
+        help="Schema application mode when local fallback graph assets are built.",
+    )
     parser.add_argument("--max-queries", type=int, default=None)
     parser.add_argument(
         "--incremental-only",
@@ -779,6 +817,7 @@ def main() -> None:
     summary = run_youtu_graphrag_test(
         queries_file=args.queries_file,
         chunks_file=args.chunks_file,
+        store_file=args.store_file,
         triples_file=args.triples_file,
         graph_file=args.graph_file,
         communities_file=args.communities_file,
@@ -798,6 +837,8 @@ def main() -> None:
         construct_timeout_sec=args.construct_timeout_sec,
         sync_mode=args.sync_mode,
         shared_corpus_dir=args.shared_corpus_dir,
+        triple_schema_file=args.triple_schema_file,
+        schema_apply_mode=args.schema_apply_mode,
         max_queries=args.max_queries,
         incremental_only=args.incremental_only,
     )

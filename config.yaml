@@ -6,6 +6,7 @@ llm:
     api_key: EMPTY
   api:
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    #base_url: https://api.deepseek.com/v1
     model: qwen-flash
     api_key_env: LLM_API_KEY
 
@@ -18,24 +19,59 @@ embedding:
     model: text-embedding-v4
     api_key_env: EMB_API_KEY
 
+ragas:
+  llm:
+    backend: api      # optional: if omitted in code, falls back to llm.*
+    api:
+      base_url: https://api.deepseek.com/v1
+      model: deepseek-chat
+      api_key_env: LLM_API_KEY_deepseek
+
 chunking:
-  chunk_size: 1600
-  overlap: 200
+  chunk_size: 1000
+  overlap: 120
 
 
 retrieval:
   top_k: 8
+
+graph_build:
+  extract_triples:
+    mode: per_chunk
+    batch_size: 5
+    concurrency: 10
+    progress_every: 50
+    min_chars: 60
+    max_chunks: null
+    max_text_chars: 5000
+    schema_file: config_triple_schema_cuad_core_v2.json
+    schema_apply_mode: prompt_only
+  build_graph:
+    edge_merge_mode: global
+    node_merge_mode: normalized
+    node_scope_with_type: true
+  build_communities:
+    resolutions: [0.6, 1.0, 1.6]
+    min_parent_overlap: 0.8
+    summary_level_max: 0
+    summary_min_size: 8
+    summary_top_per_level: 0
+    summary_min_per_level: 10
 
 comparison:
   best_effort:
     vector_top_k: 8
     vector_max_context_chars: 12000
     kg:
-      max_hops: 2
+      max_hops: 3
       max_start_entities: 5
       top_edges: 60
       max_chunks: 12
       max_context_chars: 12000
+      dynamic_early_stop: true
+      min_hops_before_stop: 1
+      relevance_threshold: 0.35
+      coverage_threshold: 0.6
     graph:
       top_communities: 3
       max_evidence: 12
@@ -55,6 +91,10 @@ comparison:
       top_edges: 24
       max_chunks: 6
       max_context_chars: 3600
+      dynamic_early_stop: true
+      min_hops_before_stop: 1
+      relevance_threshold: 0.35
+      coverage_threshold: 0.6
     graph:
       top_communities: 1
       max_evidence: 6
@@ -72,10 +112,21 @@ comparison:
       max_llm_calls: 2
 
 youtu:
-  base_url: http://127.0.0.1:8080
-  dataset: enron
+  base_url: http://127.0.0.1:8000
+  dataset: cuad_docs_upload
+  schema_file: youtu-graphrag/schemas/cuad_docs_sampled.json
+  corpus_file: data/processed/cuad_docs.jsonl
   timeout_sec: 360
   construct_poll_sec: 2
   construct_timeout_sec: 4000
   max_retries: 2
   retry_sleep_sec: 1.0
+
+evaluation:
+  answer_modes: ["reject", "open"]
+  topk_list: [10, 20]
+  include_youtu: true
+  method_mode: all   # all | exclude_youtu | only_youtu
+  judge:
+    enabled: false
+    model: qwen-flash

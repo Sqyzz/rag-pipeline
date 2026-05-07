@@ -9,9 +9,10 @@ if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from ingestion.chunking import chunk_texts
-from ingestion.load_docs import load_enron
+from ingestion.load_docs import load_enron, load_cuad
 from baselines.text_mapreduce import mapreduce_answer
 from baselines.vector_rag import answer_with_context, build_index, retrieve_and_answer
+from utils.config import load_config
 
 
 def _append_jsonl(path: str, obj: dict) -> None:
@@ -29,24 +30,39 @@ def run(
     mode: str = "all",
     embedding_mode: str = "realtime",
     batch_completion_window: str = "24h",
+    dataset: str = "enron",
+    cuad_raw_file: str = "data/raw/cuad/CUADv1.json",
+    cuad_split_name: str | None = None,
 ):
-    docs_file = "data/processed/enron_docs_sampled.jsonl"
-    chunks_file = "data/processed/chunks_sampled.jsonl"
-    idx_file = "outputs/indexes/faiss_sampled.idx"
-    store_file = "outputs/indexes/chunk_store_sampled.json"
+    if dataset == "cuad":
+        docs_file = "data/processed/cuad_docs.jsonl"
+        chunks_file = "data/processed/cuad_chunks.jsonl"
+        idx_file = "outputs/indexes/faiss_cuad.idx"
+        store_file = "outputs/indexes/chunk_store_cuad.json"
+        if not Path(docs_file).exists():
+            _progress(1, 5, f"docs not found, loading raw CUAD data: {cuad_raw_file}")
+            load_cuad(cuad_raw_file, docs_file, split_name=cuad_split_name)
+    else:
+        docs_file = "data/processed/enron_docs_sampled.jsonl"
+        chunks_file = "data/processed/chunks_sampled.jsonl"
+        idx_file = "outputs/indexes/faiss_sampled.idx"
+        store_file = "outputs/indexes/chunk_store_sampled.json"
 
-    if not Path(docs_file).exists():
-        _progress(1, 5, "sampled docs not found, loading raw enron data")
-        load_enron("data/raw/enron", "data/processed/enron_docs.jsonl")
-        docs_file = "data/processed/enron_docs.jsonl"
-        chunks_file = "data/processed/chunks.jsonl"
-        idx_file = "outputs/indexes/faiss.idx"
-        store_file = "outputs/indexes/chunk_store.json"
+        if not Path(docs_file).exists():
+            _progress(1, 5, "sampled docs not found, loading raw enron data")
+            load_enron("data/raw/enron", "data/processed/enron_docs.jsonl")
+            docs_file = "data/processed/enron_docs.jsonl"
+            chunks_file = "data/processed/chunks.jsonl"
+            idx_file = "outputs/indexes/faiss.idx"
+            store_file = "outputs/indexes/chunk_store.json"
 
     if mode in {"all", "build_only"}:
         t_build = time.perf_counter()
         _progress(2, 5, f"chunking docs -> {chunks_file}")
-        chunk_texts(docs_file, chunks_file, 1600, 200)
+        cfg = load_config("/Users/sqy/Desktop/sensei/毕业论文/imp/enterprise-graphrag/config.yaml")
+        chunk_size = cfg.chunking.chunk_size
+        overlap = cfg.chunking.overlap
+        chunk_texts(docs_file, chunks_file, chunk_size, overlap)
         _progress(3, 5, f"building vector index ({embedding_mode}) -> {idx_file}")
 
         if embedding_mode == "batch":
@@ -128,6 +144,12 @@ def run(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--dataset",
+        choices=["enron", "cuad"],
+        default="enron",
+        help="Select dataset for docs/chunks/index paths.",
+    )
+    parser.add_argument(
         "--mode",
         choices=["all", "build_only", "qa_only"],
         default="all",
@@ -136,7 +158,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--embedding-mode",
         choices=["realtime", "batch"],
-        default="realtime",
+        default="batch",
         help="realtime: normal embedding API; batch: DashScope/OpenAI-compatible Batch File API",
     )
     parser.add_argument(
@@ -144,9 +166,22 @@ if __name__ == "__main__":
         default="24h",
         help="batch completion window, e.g. 24h or 7d",
     )
+    parser.add_argument(
+        "--cuad-raw-file",
+        default="data/raw/cuad/CUADv1.json",
+        help="CUAD raw SQuAD-format json file path.",
+    )
+    parser.add_argument(
+        "--cuad-split-name",
+        default=None,
+        help="Optional split tag written into CUAD doc meta.",
+    )
     args = parser.parse_args()
     run(
         mode=args.mode,
         embedding_mode=args.embedding_mode,
         batch_completion_window=args.batch_completion_window,
+        dataset=args.dataset,
+        cuad_raw_file=args.cuad_raw_file,
+        cuad_split_name=args.cuad_split_name,
     )

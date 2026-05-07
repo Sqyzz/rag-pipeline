@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 import time
+import re
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,140 @@ def _assert_leiden_available() -> None:
         raise RuntimeError(
             "Leiden dependencies missing. Please install python-igraph and leidenalg."
         ) from _IMPORT_ERROR
+
+
+_GENERIC_HUB_LABELS = {
+    "agreement",
+    "this agreement",
+    "party",
+    "parties",
+    "each party",
+    "other party",
+    "the other party",
+    "law",
+    "applicable law",
+    "date",
+    "event",
+    "clause",
+    "document",
+    "notice",
+    "payment",
+    "jurisdiction",
+    "confidential_info",
+    "confidential information",
+    "receiving party",
+    "disclosing party",
+    "indemnifying party",
+    "indemnified party",
+    "indemnitee",
+}
+
+
+def _normalize_label(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _looks_like_numeric_hub(label: str) -> bool:
+    text = _normalize_label(label)
+    if not text:
+        return False
+    if re.fullmatch(r"[\d\W_]+", text):
+        return True
+    if re.fullmatch(r"\d+(?:\.\d+)+", text):
+        return True
+    if re.fullmatch(r"\d+\s*(day|days|month|months|year|years|business day|business days)", text):
+        return True
+    return False
+
+
+def _prune_graph_for_communities(
+    graph: dict[str, Any],
+    hub_doc_threshold: int = 0,
+    hub_degree_threshold: int = 0,
+    drop_generic_hubs: bool = False,
+    drop_numeric_hubs: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    edges = graph.get("edges", []) or []
+    nodes = graph.get("nodes", []) or []
+
+    node_doc_sets: dict[str, set[str]] = {}
+    node_degree: dict[str, int] = {}
+    for edge in edges:
+        source = str(edge.get("source", "")).strip()
+        target = str(edge.get("target", "")).strip()
+        if not source or not target:
+            continue
+        node_degree[source] = node_degree.get(source, 0) + 1
+        node_degree[target] = node_degree.get(target, 0) + 1
+        docs = {
+            str(m.get("doc_id", "")).split("#", 1)[0].strip()
+            for m in (edge.get("mentions") or [])
+            if str(m.get("doc_id", "")).strip()
+        }
+        node_doc_sets.setdefault(source, set()).update(docs)
+        node_doc_sets.setdefault(target, set()).update(docs)
+
+    pruned_nodes: set[str] = set()
+    prune_reasons = {
+        "generic_hub": 0,
+        "numeric_hub": 0,
+        "doc_frequency": 0,
+        "degree": 0,
+    }
+    for node in nodes:
+        node_id = str(node.get("id", "")).strip()
+        if not node_id:
+            continue
+        norm = _normalize_label(node_id)
+        docs = node_doc_sets.get(node_id, set())
+        degree = int(node_degree.get(node_id, 0) or 0)
+        reason = None
+        if drop_generic_hubs and norm in _GENERIC_HUB_LABELS:
+            reason = "generic_hub"
+        elif drop_numeric_hubs and _looks_like_numeric_hub(node_id):
+            reason = "numeric_hub"
+        elif int(hub_doc_threshold) > 0 and len(docs) >= int(hub_doc_threshold):
+            reason = "doc_frequency"
+        elif int(hub_degree_threshold) > 0 and degree >= int(hub_degree_threshold):
+            reason = "degree"
+        if reason:
+            pruned_nodes.add(node_id)
+            prune_reasons[reason] += 1
+
+    filtered_edges = [
+        edge for edge in edges
+        if str(edge.get("source", "")).strip() not in pruned_nodes
+        and str(edge.get("target", "")).strip() not in pruned_nodes
+    ]
+    kept_nodes = {
+        str(edge.get("source", "")).strip() for edge in filtered_edges
+    }.union({
+        str(edge.get("target", "")).strip() for edge in filtered_edges
+    })
+    filtered_nodes = [node for node in nodes if str(node.get("id", "")).strip() in kept_nodes]
+    filtered_adjacency = {
+        str(node_id): [
+            item for item in (graph.get("adjacency", {}) or {}).get(str(node_id), [])
+            if str(item.get("target", "")).strip() in kept_nodes
+        ]
+        for node_id in kept_nodes
+    }
+    diagnostics = {
+        "hub_doc_threshold": int(hub_doc_threshold),
+        "hub_degree_threshold": int(hub_degree_threshold),
+        "drop_generic_hubs": bool(drop_generic_hubs),
+        "drop_numeric_hubs": bool(drop_numeric_hubs),
+        "pruned_nodes": len(pruned_nodes),
+        "kept_nodes": len(filtered_nodes),
+        "pruned_edges": max(0, len(edges) - len(filtered_edges)),
+        "kept_edges": len(filtered_edges),
+        "prune_reasons": prune_reasons,
+    }
+    return {
+        "nodes": filtered_nodes,
+        "edges": filtered_edges,
+        "adjacency": filtered_adjacency,
+    }, diagnostics
 
 
 def _build_igraph(graph: dict[str, Any]) -> tuple[Any, list[str], dict[str, int]]:
@@ -101,7 +236,9 @@ def _run_leiden_levels(
     return levels
 
 
-def _attach_hierarchy(levels: list[dict[str, Any]]) -> None:
+def _attach_hierarchy(levels: list[dict[str, Any]], min_parent_overlap: float = 0.8) -> dict[str, Any]:
+    linked = 0
+    unlinked = 0
     for i in range(1, len(levels)):
         prev_communities = levels[i - 1]["communities"]
         cur_communities = levels[i]["communities"]
@@ -110,22 +247,41 @@ def _attach_hierarchy(levels: list[dict[str, Any]]) -> None:
             current_nodes = set(c["nodes"])
             parent_id = None
             max_overlap = -1
+            best_ratio = 0.0
             for pid, pnodes in prev_sets.items():
                 overlap = len(current_nodes.intersection(pnodes))
                 if overlap > max_overlap:
                     max_overlap = overlap
                     parent_id = pid
+                    best_ratio = (
+                        (overlap / max(len(current_nodes), 1))
+                        if current_nodes
+                        else 0.0
+                    )
+            if best_ratio < float(min_parent_overlap):
+                parent_id = None
+                unlinked += 1
+            else:
+                linked += 1
             c["parent_id"] = parent_id
+            c["parent_overlap_ratio"] = round(best_ratio, 4)
         children: dict[str, list[str]] = {}
         for c in cur_communities:
-            children.setdefault(c["parent_id"], []).append(c["community_id"])
+            if c["parent_id"]:
+                children.setdefault(c["parent_id"], []).append(c["community_id"])
         for p in prev_communities:
             p["children_ids"] = sorted(children.get(p["community_id"], []))
     if levels:
         for c in levels[0]["communities"]:
             c.setdefault("parent_id", None)
+            c.setdefault("parent_overlap_ratio", 1.0)
         for c in levels[-1]["communities"]:
             c.setdefault("children_ids", [])
+    return {
+        "min_parent_overlap": float(min_parent_overlap),
+        "linked_children": int(linked),
+        "unlinked_children": int(unlinked),
+    }
 
 
 def _summarize_community(nodes: list[str], edges: list[dict], level: int) -> tuple[str, dict]:
@@ -147,45 +303,114 @@ Edges:
     return llm_chat([{"role": "user", "content": prompt}], temperature=0.1, return_meta=True)
 
 
+def _build_summary_plan(
+    levels: list[dict[str, Any]],
+    summary_level_max: int,
+    summary_min_size: int,
+    summary_top_per_level: int,
+    summary_min_per_level: int,
+) -> tuple[set[str], dict[int, int], dict[int, int]]:
+    """
+    Build a summary plan by level.
+
+    - Base rule: level <= summary_level_max AND size >= summary_min_size AND rank <= top_limit
+    - Fallback: if planned summaries in an eligible level are fewer than summary_min_per_level,
+      relax size constraint and backfill from largest remaining communities in the same level.
+    """
+    planned_ids: set[str] = set()
+    base_counts: dict[int, int] = {}
+    relaxed_counts: dict[int, int] = {}
+
+    for lv in levels:
+        level_idx = int(lv["level"])
+        rows = lv["communities"]
+        top_limit = int(summary_top_per_level) if int(summary_top_per_level) > 0 else len(rows)
+        capped = rows[:top_limit]
+        if level_idx > int(summary_level_max):
+            base_counts[level_idx] = 0
+            relaxed_counts[level_idx] = 0
+            continue
+
+        base = [
+            c for c in capped
+            if int(c.get("size", 0)) >= int(summary_min_size)
+        ]
+        chosen: list[dict[str, Any]] = list(base)
+        if int(summary_min_per_level) > 0 and len(chosen) < int(summary_min_per_level):
+            need = int(summary_min_per_level) - len(chosen)
+            existing_ids = {str(c.get("community_id", "")) for c in chosen}
+            pool = [c for c in capped if str(c.get("community_id", "")) not in existing_ids]
+            chosen.extend(pool[:need])
+
+        for c in chosen:
+            cid = str(c.get("community_id", "")).strip()
+            if cid:
+                planned_ids.add(cid)
+
+        base_counts[level_idx] = len(base)
+        relaxed_counts[level_idx] = max(0, len(chosen) - len(base))
+
+    return planned_ids, base_counts, relaxed_counts
+
+
 def build_communities(
     graph_file: str,
     out_file: str,
     resolutions: list[float] | None = None,
+    min_parent_overlap: float = 0.8,
     summary_level_max: int = 0,
     summary_min_size: int = 8,
     summary_top_per_level: int = 0,
+    summary_min_per_level: int = 10,
+    prune_hub_doc_threshold: int = 0,
+    prune_hub_degree_threshold: int = 0,
+    prune_generic_hubs: bool = False,
+    prune_numeric_hubs: bool = False,
 ) -> dict:
     _assert_leiden_available()
     if resolutions is None:
         resolutions = [0.6, 1.0, 1.6]
+    if float(min_parent_overlap) < 0 or float(min_parent_overlap) > 1:
+        raise ValueError("min_parent_overlap must be in [0, 1]")
 
     _progress(f"start graph_file={graph_file}")
     graph = json.loads(Path(graph_file).read_text(encoding="utf-8"))
-    edges = graph.get("edges", [])
-    _progress(f"graph loaded nodes={len(graph.get('nodes', []))}, edges={len(edges)}")
-    g, _, _ = _build_igraph(graph)
+    raw_nodes = len(graph.get("nodes", []))
+    raw_edges = len(graph.get("edges", []))
+    graph_for_partition, prune_diag = _prune_graph_for_communities(
+        graph,
+        hub_doc_threshold=prune_hub_doc_threshold,
+        hub_degree_threshold=prune_hub_degree_threshold,
+        drop_generic_hubs=prune_generic_hubs,
+        drop_numeric_hubs=prune_numeric_hubs,
+    )
+    edges = graph_for_partition.get("edges", [])
+    _progress(
+        f"graph loaded nodes={raw_nodes}, edges={raw_edges}; "
+        f"partition_graph nodes={len(graph_for_partition.get('nodes', []))}, edges={len(edges)}"
+    )
+    g, _, _ = _build_igraph(graph_for_partition)
     _progress(f"igraph built vertices={g.vcount()} edges={g.ecount()}")
     levels = _run_leiden_levels(g, g.vs["name"], resolutions=resolutions)
-    _attach_hierarchy(levels)
+    hierarchy_meta = _attach_hierarchy(levels, min_parent_overlap=min_parent_overlap)
     _progress(f"hierarchy attached levels={len(levels)}")
 
     telemetry = Telemetry()
     all_communities: list[dict[str, Any]] = []
     total_communities = sum(len(lv["communities"]) for lv in levels)
-    plan_to_summarize = 0
-    for lv in levels:
-        level_rows = lv["communities"]
-        top_limit = int(summary_top_per_level) if int(summary_top_per_level) > 0 else len(level_rows)
-        for idx, c in enumerate(level_rows, start=1):
-            should_summarize = (
-                int(c["level"]) <= int(summary_level_max)
-                and int(c.get("size", 0)) >= int(summary_min_size)
-                and idx <= top_limit
-            )
-            if should_summarize:
-                plan_to_summarize += 1
+    summary_plan_ids, base_counts, relaxed_counts = _build_summary_plan(
+        levels=levels,
+        summary_level_max=summary_level_max,
+        summary_min_size=summary_min_size,
+        summary_top_per_level=summary_top_per_level,
+        summary_min_per_level=summary_min_per_level,
+    )
+    plan_to_summarize = len(summary_plan_ids)
+    relaxed_total = sum(relaxed_counts.values())
     _progress(
-        f"summary policy: level_max={summary_level_max}, min_size={summary_min_size}, top_per_level={summary_top_per_level}; planned={plan_to_summarize}/{total_communities}"
+        f"summary policy: level_max={summary_level_max}, min_size={summary_min_size}, "
+        f"top_per_level={summary_top_per_level}, min_per_level={summary_min_per_level}; "
+        f"planned={plan_to_summarize}/{total_communities} (relaxed_backfill={relaxed_total})"
     )
 
     processed = 0
@@ -193,17 +418,13 @@ def build_communities(
     for level in levels:
         _progress(f"summarizing level={level['level']} communities={len(level['communities'])}")
         level_rows = level["communities"]
-        top_limit = int(summary_top_per_level) if int(summary_top_per_level) > 0 else len(level_rows)
         for idx, community in enumerate(level_rows, start=1):
             comp_set = set(community["nodes"])
             comp_edges = [
-                e for e in edges if e["source"] in comp_set and e["target"] in comp_set
+                e for e in graph_for_partition.get("edges", []) if e["source"] in comp_set and e["target"] in comp_set
             ]
-            should_summarize = (
-                int(community["level"]) <= int(summary_level_max)
-                and int(community.get("size", 0)) >= int(summary_min_size)
-                and idx <= top_limit
-            )
+            community_id = str(community.get("community_id", "")).strip()
+            should_summarize = community_id in summary_plan_ids
             community["edges"] = [e["edge_id"] for e in comp_edges]
             if should_summarize:
                 summary, meta = _summarize_community(
@@ -223,7 +444,9 @@ def build_communities(
                         "summary_level_max": int(summary_level_max),
                         "summary_min_size": int(summary_min_size),
                         "summary_top_per_level": int(summary_top_per_level),
+                        "summary_min_per_level": int(summary_min_per_level),
                     },
+                    "planned": False,
                 }
             all_communities.append(community)
             processed += 1
@@ -236,11 +459,16 @@ def build_communities(
         "algorithm": "leiden",
         "is_hierarchical": True,
         "resolutions": resolutions,
+        "hierarchy_meta": hierarchy_meta,
         "summary_policy": {
             "summary_level_max": int(summary_level_max),
             "summary_min_size": int(summary_min_size),
             "summary_top_per_level": int(summary_top_per_level),
+            "summary_min_per_level": int(summary_min_per_level),
+            "planned_base_by_level": {str(k): int(v) for k, v in base_counts.items()},
+            "planned_relaxed_backfill_by_level": {str(k): int(v) for k, v in relaxed_counts.items()},
         },
+        "partition_pruning": prune_diag,
         "levels": [
             {
                 "level": lv["level"],
@@ -261,9 +489,13 @@ def build_communities(
         "graph_file": graph_file,
         "community_file": out_file,
         "algorithm": "leiden",
+        "min_parent_overlap": float(min_parent_overlap),
+        "linked_children": int(hierarchy_meta.get("linked_children", 0)),
+        "unlinked_children": int(hierarchy_meta.get("unlinked_children", 0)),
         "num_levels": len(levels),
         "num_communities": len(all_communities),
         "summarized_communities": summarized_count,
+        "partition_pruning": prune_diag,
         "telemetry": telemetry.to_dict(),
     }
 
@@ -277,6 +509,12 @@ def main() -> None:
         "--resolutions",
         default="0.6,1.0,1.6",
         help="comma-separated leiden resolution parameters, low->high",
+    )
+    parser.add_argument(
+        "--min-parent-overlap",
+        type=float,
+        default=0.8,
+        help="Minimum child->parent node overlap ratio required to attach hierarchy parent_id.",
     )
     parser.add_argument(
         "--summary-level-max",
@@ -296,15 +534,34 @@ def main() -> None:
         default=0,
         help="only pre-generate summaries for top-N largest communities per level; 0 means no top-N limit",
     )
+    parser.add_argument(
+        "--summary-min-per-level",
+        type=int,
+        default=10,
+        help=(
+            "minimum summaries per eligible level. If base policy yields fewer summaries, "
+            "auto-backfill from largest communities in that level."
+        ),
+    )
+    parser.add_argument("--prune-hub-doc-threshold", type=int, default=0)
+    parser.add_argument("--prune-hub-degree-threshold", type=int, default=0)
+    parser.add_argument("--prune-generic-hubs", default="false")
+    parser.add_argument("--prune-numeric-hubs", default="false")
     args = parser.parse_args()
     resolutions = [float(x.strip()) for x in args.resolutions.split(",") if x.strip()]
     metrics = build_communities(
         args.graph_file,
         args.out_file,
         resolutions=resolutions,
+        min_parent_overlap=args.min_parent_overlap,
         summary_level_max=args.summary_level_max,
         summary_min_size=args.summary_min_size,
         summary_top_per_level=args.summary_top_per_level,
+        summary_min_per_level=args.summary_min_per_level,
+        prune_hub_doc_threshold=args.prune_hub_doc_threshold,
+        prune_hub_degree_threshold=args.prune_hub_degree_threshold,
+        prune_generic_hubs=str(args.prune_generic_hubs).strip().lower() in {"1", "true", "yes", "y", "on"},
+        prune_numeric_hubs=str(args.prune_numeric_hubs).strip().lower() in {"1", "true", "yes", "y", "on"},
     )
     metrics_path = Path(args.metrics_file)
     metrics_path.parent.mkdir(parents=True, exist_ok=True)

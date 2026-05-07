@@ -1,0 +1,129 @@
+{
+  "entity_types": [
+    "party",
+    "agreement",
+    "clause",
+    "obligation",
+    "right",
+    "condition",
+    "payment",
+    "date",
+    "duration",
+    "event",
+    "law",
+    "jurisdiction",
+    "notice",
+    "location",
+    "document"
+  ],
+  "relations": [
+    {
+      "name": "party_to",
+      "subject_types": ["party"],
+      "object_types": ["agreement"],
+      "aliases": ["party to", "enters into", "signs", "between"]
+    },
+    {
+      "name": "effective_on",
+      "subject_types": ["agreement", "clause"],
+      "object_types": ["date"],
+      "aliases": ["effective on", "effective date", "commences on", "starts on"]
+    },
+    {
+      "name": "expires_on",
+      "subject_types": ["agreement", "clause"],
+      "object_types": ["date"],
+      "aliases": ["expires on", "ends on", "terminates on"]
+    },
+    {
+      "name": "has_term",
+      "subject_types": ["agreement"],
+      "object_types": ["duration"],
+      "aliases": ["term", "valid for", "duration", "for a period of"]
+    },
+    {
+      "name": "renews_for",
+      "subject_types": ["agreement", "clause"],
+      "object_types": ["duration", "date"],
+      "aliases": ["renews for", "auto-renews", "renewal term", "extends for"]
+    },
+    {
+      "name": "obligates",
+      "subject_types": ["clause", "agreement", "event"],
+      "object_types": ["obligation", "party"],
+      "aliases": ["requires", "obligates", "must", "shall"]
+    },
+    {
+      "name": "grants_right_to",
+      "subject_types": ["clause", "agreement", "right"],
+      "object_types": ["party"],
+      "aliases": ["grants right to", "entitled to", "may", "has the right to"]
+    },
+    {
+      "name": "subject_to",
+      "subject_types": ["obligation", "right", "clause", "agreement"],
+      "object_types": ["condition", "event", "law", "jurisdiction"],
+      "aliases": ["subject to", "conditioned on", "provided that"]
+    },
+    {
+      "name": "pays",
+      "subject_types": ["party"],
+      "object_types": ["payment", "party"],
+      "aliases": ["pays", "payable to", "compensates", "remits"]
+    },
+    {
+      "name": "payment_due_on",
+      "subject_types": ["payment", "obligation"],
+      "object_types": ["date", "duration", "event"],
+      "aliases": ["due on", "payable within", "payment date", "invoice due"]
+    },
+    {
+      "name": "terminates_on_event",
+      "subject_types": ["agreement", "clause"],
+      "object_types": ["event", "condition"],
+      "aliases": ["terminates upon", "termination event", "may terminate if", "ends if"]
+    },
+    {
+      "name": "governed_by",
+      "subject_types": ["agreement", "clause"],
+      "object_types": ["law"],
+      "aliases": ["governed by", "laws of", "in accordance with the laws of"]
+    },
+    {
+      "name": "dispute_resolved_in",
+      "subject_types": ["agreement", "clause", "event"],
+      "object_types": ["jurisdiction", "location"],
+      "aliases": ["jurisdiction", "venue", "arbitration in", "resolved in"]
+    },
+    {
+      "name": "notice_to",
+      "subject_types": ["notice", "party", "clause"],
+      "object_types": ["party", "location"],
+      "aliases": ["notice to", "notify", "written notice to", "deliver notice to"]
+    },
+    {
+      "name": "confidentiality_applies_to",
+      "subject_types": ["clause", "agreement", "obligation"],
+      "object_types": ["document", "party", "obligation"],
+      "aliases": ["confidential", "non-disclosure", "keep confidential", "shall not disclose"]
+    },
+    {
+      "name": "assignable_by",
+      "subject_types": ["agreement", "right", "obligation", "clause"],
+      "object_types": ["party"],
+      "aliases": ["assignable by", "assignment by", "may assign", "transfer by"]
+    },
+    {
+      "name": "limits_liability_of",
+      "subject_types": ["clause", "agreement"],
+      "object_types": ["party", "obligation", "payment"],
+      "aliases": ["liability limited", "cap on liability", "limits liability", "maximum liability"]
+    },
+    {
+      "name": "excepted_by_force_majeure",
+      "subject_types": ["obligation", "agreement", "clause"],
+      "object_types": ["event", "condition"],
+      "aliases": ["force majeure", "excused by", "not liable for delay due to"]
+    }
+  ]
+}

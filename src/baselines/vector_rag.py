@@ -15,6 +15,10 @@ def _normalize_rows(vectors: np.ndarray) -> np.ndarray:
     return vectors / norms
 
 
+def _doc_prefix(value):
+    return str(value or "").split("#", 1)[0].strip()
+
+
 def _read_chunk_meta(chunks_file):
     texts = []
     meta = []
@@ -114,7 +118,15 @@ def retrieve_and_answer(query, idx_file, store_file, top_k):
     return contexts
 
 
-def retrieve_with_evidence(query, idx_file, store_file, top_k, return_meta=False):
+def retrieve_with_evidence(
+    query,
+    idx_file,
+    store_file,
+    top_k,
+    return_meta=False,
+    doc_prefix_filter=None,
+    scan_multiplier=50,
+):
     index = faiss.read_index(idx_file)
     with open(store_file, encoding="utf-8") as r:
         store = json.load(r)
@@ -124,34 +136,76 @@ def retrieve_with_evidence(query, idx_file, store_file, top_k, return_meta=False
     emb_meta = q_emb_out[1]
     q_emb = _normalize_rows(q_emb)
 
-    scores, indices = index.search(q_emb, top_k)
+    if doc_prefix_filter:
+        search_k = min(len(store), max(int(top_k), int(top_k) * int(scan_multiplier)))
+    else:
+        search_k = int(top_k)
+    scores, indices = index.search(q_emb, search_k)
     evidence = []
+    wanted_prefix = _doc_prefix(doc_prefix_filter) if doc_prefix_filter else ""
     for rank, idx in enumerate(indices[0], start=1):
         if not (0 <= idx < len(store)):
             continue
         chunk = store[idx]
+        if wanted_prefix and _doc_prefix(chunk.get("doc_id")) != wanted_prefix:
+            continue
         evidence.append(
             {
-                "rank": rank,
+                "rank": len(evidence) + 1,
                 "score": float(scores[0][rank - 1]),
                 "chunk_id": chunk.get("chunk_id"),
                 "doc_id": chunk.get("doc_id"),
+                "source": chunk.get("source"),
+                "meta": chunk.get("meta", {}),
                 "text": chunk.get("text", ""),
             }
         )
+        if len(evidence) >= int(top_k):
+            break
     if return_meta:
         return evidence, {"embedding": emb_meta}
     return evidence
 
 
-def answer_with_context(query, contexts, max_completion_tokens=None, return_meta=False):
-    prompt = f"""
-Answer the question using only the following contexts:
+def answer_with_context(
+    query,
+    contexts,
+    max_completion_tokens=None,
+    return_meta=False,
+    query_type: str | None = None,
+    answer_mode: str = "reject",
+):
+    mode = str(answer_mode or "reject").strip().lower()
+    reject_line = "If evidence is insufficient, return exactly: NOT_FOUND"
+    open_line = (
+        "If evidence is insufficient, you may answer using general knowledge. "
+        "Prefix the answer with: OUTSIDE_EVIDENCE:"
+    )
+    insufficient_policy = reject_line if mode == "reject" else open_line
+
+    if str(query_type or "").strip().lower() == "global_summary":
+        prompt = f"""
+Summarize the key themes and risks from the provided contexts.
+Use only the provided contexts.
+Return 3 concise bullet points (no preface, no legal advice).
+{insufficient_policy}
 
 {contexts}
 
 Question:
 {query}
-Just answer the question briefly. No explanation is needed if not necessary.
+"""
+    else:
+        prompt = f"""
+Answer the question using only the following contexts.
+This is an extractive QA task.
+Return the shortest exact span copied from the context that answers the question.
+Do not add explanation, bullet points, or legal commentary.
+{insufficient_policy}
+
+{contexts}
+
+Question:
+{query}
 """
     return llm.chat(prompt, max_tokens=max_completion_tokens, return_meta=return_meta)

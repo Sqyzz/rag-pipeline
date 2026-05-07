@@ -15,6 +15,7 @@ if __package__ is None or __package__ == "":
 
 from baselines.graph_rag import answer_with_graphrag
 from baselines.kg_rag import answer_with_kg
+from baselines.lightrag_adapter import answer_with_lightrag
 from baselines.vector_rag import answer_with_context, retrieve_with_evidence
 from evaluation.graph_structure_metrics import compute_graph_structure_metrics
 from graph_build.build_communities import build_communities
@@ -63,6 +64,55 @@ def _parse_bool(raw: str | bool | None, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _normalize_answer_mode(answer_mode: str | None) -> str:
+    mode = str(answer_mode or "reject").strip().lower()
+    return mode if mode in {"reject", "open"} else "reject"
+
+
+def _normalize_youtu_route_type(route_type: str | None) -> str:
+    mode = str(route_type or "").strip().lower()
+    if mode in {"", "none", "auto", "default"}:
+        return ""
+    return mode
+
+
+def _resolve_answer_modes(answer_mode: str = "reject", answer_modes: str | None = None) -> list[str]:
+    valid = {"reject", "open"}
+    if answer_modes:
+        raw_modes = [x.strip() for x in str(answer_modes).split(",") if x.strip()]
+    else:
+        raw_modes = [str(answer_mode or "reject")]
+    out: list[str] = []
+    for raw in raw_modes:
+        mode = str(raw or "").strip().lower()
+        if mode not in valid:
+            raise ValueError(f"Unsupported answer mode: {raw}. Expected one of: {sorted(valid)}")
+        if mode not in out:
+            out.append(mode)
+    return out or ["reject"]
+
+
+def _row_answer_mode(row: dict) -> str:
+    return _normalize_answer_mode(row.get("mode"))
+
+
+def _find_matching_row_idx(existing_rows: list[dict], qid: str, qtext: str, answer_mode: str) -> int:
+    mode = _normalize_answer_mode(answer_mode)
+    if qid:
+        for i, r in enumerate(existing_rows):
+            if str(r.get("qid", "")).strip() != qid:
+                continue
+            if _row_answer_mode(r) == mode:
+                return i
+    if qtext:
+        for i, r in enumerate(existing_rows):
+            if str(r.get("query", "")).strip().lower() != qtext:
+                continue
+            if _row_answer_mode(r) == mode:
+                return i
+    return -1
+
+
 def _load_queries(path: str) -> list[dict]:
     rows = []
     with open(path, encoding="utf-8") as f:
@@ -70,6 +120,65 @@ def _load_queries(path: str) -> list[dict]:
             if line.strip():
                 rows.append(json.loads(line))
     return rows
+
+
+def _infer_dataset_tag(queries_file: str, queries: list[dict]) -> str:
+    qf = str(queries_file).lower()
+    if "cuad" in qf:
+        return "cuad"
+    if "enron" in qf:
+        return "enron"
+    sample_qids = [str(q.get("qid", "")) for q in queries[:30]]
+    if any("__" in qid and "-" in qid for qid in sample_qids):
+        return "cuad_like"
+    if any(qid.startswith("q_") for qid in sample_qids):
+        return "enron_like"
+    return "unknown"
+
+
+def _query_consistency_snapshot(queries: list[dict]) -> dict:
+    qids = [str(q.get("qid", "")).strip() for q in queries]
+    non_empty_qids = [x for x in qids if x]
+    unique_qids = len(set(non_empty_qids))
+    duplicate_qids = max(len(non_empty_qids) - unique_qids, 0)
+    missing_query_text = sum(1 for q in queries if not str(q.get("query", "")).strip())
+    by_type: dict[str, int] = {}
+    for q in queries:
+        t = str(q.get("type", "unknown")).strip() or "unknown"
+        by_type[t] = by_type.get(t, 0) + 1
+    return {
+        "total_queries": len(queries),
+        "queries_with_qid": len(non_empty_qids),
+        "unique_qids": unique_qids,
+        "duplicate_qids": duplicate_qids,
+        "missing_query_text": missing_query_text,
+        "by_type": by_type,
+    }
+
+
+def _extract_query_doc_key(query_row: dict) -> str:
+    meta = query_row.get("meta") if isinstance(query_row.get("meta"), dict) else {}
+    candidates = [
+        str(meta.get("query_doc_key", "")).strip(),
+        str(meta.get("title", "")).strip(),
+    ]
+    qid = str(query_row.get("qid", "")).strip()
+    if "__" in qid:
+        candidates.append(qid.split("__", 1)[0].strip())
+    for c in candidates:
+        if c:
+            return c
+    return ""
+
+
+def _scope_query_for_cuad(raw_query: str, query_doc_key: str, dataset_tag: str, enabled: bool = True) -> str:
+    if not enabled:
+        return raw_query
+    if dataset_tag not in {"cuad", "cuad_like"}:
+        return raw_query
+    if not query_doc_key:
+        return raw_query
+    return f'Contract title: "{query_doc_key}"\nQuestion: {raw_query}'
 
 
 def _load_jsonl(path: str) -> list[dict]:
@@ -84,11 +193,34 @@ def _load_jsonl(path: str) -> list[dict]:
     return rows
 
 
+def _abs_path(path: str) -> str:
+    return str(Path(path).expanduser().resolve())
+
+
 def _maybe_read_json(path: str) -> dict | None:
     p = Path(path)
     if not p.exists():
         return None
     return json.loads(p.read_text(encoding="utf-8"))
+
+
+def _is_json_array_file(path: str) -> bool:
+    p = Path(path)
+    if not p.exists() or not p.is_file():
+        return False
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            head = f.read(4096)
+    except Exception:
+        return False
+    if not str(head).lstrip().startswith("["):
+        return False
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return isinstance(payload, list)
+    except Exception:
+        return False
 
 
 def _load_yaml(path: str) -> dict:
@@ -97,6 +229,27 @@ def _load_yaml(path: str) -> dict:
         return {}
     with p.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
+
+
+def _detect_max_precomputed_summary_level(communities_file: str) -> int | None:
+    payload = _maybe_read_json(communities_file)
+    if not isinstance(payload, dict):
+        return None
+    communities = payload.get("communities", [])
+    if not isinstance(communities, list):
+        return None
+    levels = []
+    for c in communities:
+        if not isinstance(c, dict):
+            continue
+        if str(c.get("summary", "")).strip():
+            try:
+                levels.append(int(c.get("level", 0)))
+            except (TypeError, ValueError):
+                continue
+    if not levels:
+        return None
+    return max(levels)
 
 
 def _write_json(path: str, payload: dict) -> None:
@@ -135,6 +288,100 @@ def _latency_stats(samples_ms: list[int]) -> dict:
         "p50": round(_percentile(vals, 0.5), 2),
         "p95": round(_percentile(vals, 0.95), 2),
     }
+
+
+def _to_float_or_none(v: object) -> float | None:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_youtu_construct_build_stats(status_payload: dict | None) -> dict:
+    if not isinstance(status_payload, dict):
+        return {}
+    direct = status_payload.get("build_stats")
+    if isinstance(direct, dict):
+        return direct
+    data = status_payload.get("data")
+    if isinstance(data, dict):
+        nested = data.get("build_stats")
+        if isinstance(nested, dict):
+            return nested
+    result = status_payload.get("result")
+    if isinstance(result, dict):
+        nested = result.get("build_stats")
+        if isinstance(nested, dict):
+            return nested
+    return {}
+
+
+def _extract_youtu_route_metrics(rows: list[dict], regime_names: list[str]) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for rg in regime_names:
+        route_type_counts: dict[str, int] = {}
+        fallback_true = 0
+        fallback_false = 0
+        fallback_unknown = 0
+        confidence_values: list[float] = []
+        reason_samples: dict[str, int] = {}
+
+        for row in rows:
+            regimes_payload = row.get("regimes")
+            if not isinstance(regimes_payload, dict):
+                continue
+            regime_payload = regimes_payload.get(rg)
+            if not isinstance(regime_payload, dict):
+                continue
+            youtu_payload = regime_payload.get("youtu_graph_rag")
+            if not isinstance(youtu_payload, dict):
+                continue
+
+            route_type = str(youtu_payload.get("route_type", "") or "").strip() or "unknown"
+            route_type_counts[route_type] = route_type_counts.get(route_type, 0) + 1
+
+            if "route_fallback" in youtu_payload:
+                route_fallback = youtu_payload.get("route_fallback")
+                if isinstance(route_fallback, bool):
+                    if route_fallback:
+                        fallback_true += 1
+                    else:
+                        fallback_false += 1
+                else:
+                    fallback_unknown += 1
+            else:
+                fallback_unknown += 1
+
+            route_conf = _to_float_or_none(youtu_payload.get("route_confidence"))
+            if route_conf is not None:
+                confidence_values.append(route_conf)
+
+            route_reason = str(youtu_payload.get("route_reason", "") or "").strip()
+            if route_reason:
+                reason_samples[route_reason] = reason_samples.get(route_reason, 0) + 1
+
+        top_reasons = sorted(reason_samples.items(), key=lambda x: x[1], reverse=True)[:10]
+        out[rg] = {
+            "num_samples": int(sum(route_type_counts.values())),
+            "route_type_counts": route_type_counts,
+            "fallback": {
+                "true": fallback_true,
+                "false": fallback_false,
+                "unknown": fallback_unknown,
+            },
+            "route_confidence": {
+                "count": len(confidence_values),
+                "avg": round(sum(confidence_values) / len(confidence_values), 6) if confidence_values else None,
+                "p50": round(_percentile(confidence_values, 0.5), 6) if confidence_values else None,
+                "p95": round(_percentile(confidence_values, 0.95), 6) if confidence_values else None,
+                "min": round(min(confidence_values), 6) if confidence_values else None,
+                "max": round(max(confidence_values), 6) if confidence_values else None,
+            },
+            "top_route_reasons": [{"reason": k, "count": v} for k, v in top_reasons],
+        }
+    return out
 
 
 def _merge_telemetry(dst: Telemetry, src: dict | None) -> None:
@@ -264,6 +511,7 @@ def _pack_contexts_with_budget(
 
 def _run_vector(
     query: str,
+    query_type: str,
     idx_file: str,
     store_file: str,
     top_k: int,
@@ -271,6 +519,8 @@ def _run_vector(
     max_chunks: int | None = None,
     max_completion_tokens: int | None = None,
     budget_manager: BudgetManager | None = None,
+    doc_prefix_filter: str | None = None,
+    answer_mode: str = "reject",
 ) -> tuple[dict, dict]:
     evidence, retrieve_meta = retrieve_with_evidence(
         query=query,
@@ -278,6 +528,7 @@ def _run_vector(
         store_file=store_file,
         top_k=top_k,
         return_meta=True,
+        doc_prefix_filter=doc_prefix_filter,
     )
     contexts = _pack_contexts_with_budget(
         [x["text"] for x in evidence],
@@ -290,12 +541,15 @@ def _run_vector(
         contexts=contexts,
         max_completion_tokens=max_completion_tokens,
         return_meta=True,
+        query_type=query_type,
+        answer_mode=answer_mode,
     )
     t = Telemetry()
     t.add_embedding((retrieve_meta or {}).get("embedding"))
     t.add_llm(answer_meta)
     payload = {
         "answer": answer,
+        "answer_mode": _normalize_answer_mode(answer_mode),
         "evidence": evidence,
         "telemetry": {
             "embedding": (retrieve_meta or {}).get("embedding"),
@@ -306,20 +560,201 @@ def _run_vector(
     return payload, t.to_dict()
 
 
-def ensure_graph_assets(chunks_file: str, triples_file: str, graph_file: str, communities_file: str) -> dict:
+def ensure_graph_assets(
+    chunks_file: str,
+    triples_file: str,
+    graph_file: str,
+    communities_file: str,
+    graph_edge_merge_mode: str = "global",
+    graph_node_merge_mode: str = "normalized",
+    graph_node_scope_with_type: bool = True,
+    triple_schema_file: str | None = "config_triple_schema.json",
+    schema_apply_mode: str = "strict",
+) -> dict:
+    def _prefer(explicit_value, explicit_default, cfg_value):
+        if explicit_value != explicit_default:
+            return explicit_value
+        return explicit_value if cfg_value is None else cfg_value
+
+    def _as_int(value, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _as_float(value, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _as_opt_int(value) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _as_float_list(value, default: list[float]) -> list[float]:
+        if value is None:
+            return list(default)
+        if isinstance(value, str):
+            out = []
+            for x in value.split(","):
+                x = str(x).strip()
+                if x:
+                    out.append(float(x))
+            return out or list(default)
+        out = []
+        try:
+            for x in value:
+                out.append(float(x))
+        except Exception:  # noqa: BLE001
+            return list(default)
+        return out or list(default)
+
+    graph_build_cfg = _g(cfg, "graph_build", None)
+    extract_cfg = _g(graph_build_cfg, "extract_triples", None)
+    graph_cfg = _g(graph_build_cfg, "build_graph", None)
+    community_cfg = _g(graph_build_cfg, "build_communities", None)
+
+    effective_extract_mode = str(_prefer("per_chunk", "per_chunk", _g(extract_cfg, "mode", None))).strip().lower()
+    effective_extract_batch_size = _as_int(_prefer(4, 4, _g(extract_cfg, "batch_size", None)), 4)
+    effective_extract_progress_every = _as_int(_prefer(50, 50, _g(extract_cfg, "progress_every", None)), 50)
+    effective_extract_min_chars = _as_int(_prefer(60, 60, _g(extract_cfg, "min_chars", None)), 60)
+    effective_extract_max_chunks = _as_opt_int(_prefer(None, None, _g(extract_cfg, "max_chunks", None)))
+    effective_extract_max_text_chars = _as_int(_prefer(5000, 5000, _g(extract_cfg, "max_text_chars", None)), 5000)
+    effective_extract_concurrency = _as_int(_prefer(1, 1, _g(extract_cfg, "concurrency", None)), 1)
+    effective_triple_schema_file = _prefer(
+        triple_schema_file,
+        "config_triple_schema.json",
+        _g(extract_cfg, "schema_file", None),
+    )
+    effective_schema_apply_mode = str(
+        _prefer(schema_apply_mode, "strict", _g(extract_cfg, "schema_apply_mode", None))
+    ).strip().lower()
+
+    effective_edge_merge_mode = str(
+        _prefer(graph_edge_merge_mode, "global", _g(graph_cfg, "edge_merge_mode", None))
+    ).strip()
+    effective_node_merge_mode = str(
+        _prefer(graph_node_merge_mode, "normalized", _g(graph_cfg, "node_merge_mode", None))
+    ).strip()
+    effective_node_scope_with_type = bool(
+        _prefer(graph_node_scope_with_type, True, _g(graph_cfg, "node_scope_with_type", None))
+    )
+
+    effective_resolutions = _as_float_list(_g(community_cfg, "resolutions", None), [0.6, 1.0, 1.6])
+    effective_min_parent_overlap = _as_float(_g(community_cfg, "min_parent_overlap", 0.8), 0.8)
+    effective_summary_level_max = _as_int(_g(community_cfg, "summary_level_max", 0), 0)
+    effective_summary_min_size = _as_int(_g(community_cfg, "summary_min_size", 8), 8)
+    effective_summary_top_per_level = _as_int(_g(community_cfg, "summary_top_per_level", 0), 0)
+    effective_summary_min_per_level = _as_int(_g(community_cfg, "summary_min_per_level", 10), 10)
+
     metrics = {}
-    if not Path(triples_file).exists():
-        metrics["triple_extract"] = extract_triples(chunks_file, triples_file)
-    if not Path(graph_file).exists():
-        metrics["graph_build"] = build_graph(triples_file, graph_file)
-    if not Path(communities_file).exists():
-        metrics["community_build"] = build_communities(graph_file, communities_file)
+    tp = Path(triples_file)
+    gp = Path(graph_file)
+    cp = Path(communities_file)
+
+    if not tp.exists():
+        t0 = time.perf_counter()
+        item = extract_triples(
+            chunks_file,
+            triples_file,
+            mode=effective_extract_mode,
+            batch_size=effective_extract_batch_size,
+            progress_every=effective_extract_progress_every,
+            min_chars=effective_extract_min_chars,
+            max_chunks=effective_extract_max_chunks,
+            max_text_chars=effective_extract_max_text_chars,
+            concurrency=effective_extract_concurrency,
+            schema_file=effective_triple_schema_file,
+            schema_apply_mode=effective_schema_apply_mode,
+        )
+        item["wall_time_ms"] = int((time.perf_counter() - t0) * 1000)
+        metrics["triple_extract"] = item
+    else:
+        metrics["triple_extract"] = {
+            "skipped": True,
+            "reason": "already_exists",
+            "triples_file": str(tp),
+            "wall_time_ms": 0,
+        }
+
+    if not gp.exists():
+        t0 = time.perf_counter()
+        item = build_graph(
+            triples_file,
+            graph_file,
+            edge_merge_mode=effective_edge_merge_mode,
+            node_merge_mode=effective_node_merge_mode,
+            node_scope_with_type=effective_node_scope_with_type,
+        )
+        item["wall_time_ms"] = int((time.perf_counter() - t0) * 1000)
+        metrics["graph_build"] = item
+    else:
+        metrics["graph_build"] = {
+            "skipped": True,
+            "reason": "already_exists",
+            "graph_file": str(gp),
+            "wall_time_ms": 0,
+        }
+
+    if not cp.exists():
+        t0 = time.perf_counter()
+        item = build_communities(
+            graph_file,
+            communities_file,
+            resolutions=effective_resolutions,
+            min_parent_overlap=effective_min_parent_overlap,
+            summary_level_max=effective_summary_level_max,
+            summary_min_size=effective_summary_min_size,
+            summary_top_per_level=effective_summary_top_per_level,
+            summary_min_per_level=effective_summary_min_per_level,
+        )
+        item["wall_time_ms"] = int((time.perf_counter() - t0) * 1000)
+        metrics["community_build"] = item
+    else:
+        metrics["community_build"] = {
+            "skipped": True,
+            "reason": "already_exists",
+            "community_file": str(cp),
+            "wall_time_ms": 0,
+        }
+    metrics["effective_graph_build_config"] = {
+        "extract_triples": {
+            "mode": effective_extract_mode,
+            "batch_size": effective_extract_batch_size,
+            "progress_every": effective_extract_progress_every,
+            "min_chars": effective_extract_min_chars,
+            "max_chunks": effective_extract_max_chunks,
+            "max_text_chars": effective_extract_max_text_chars,
+            "concurrency": effective_extract_concurrency,
+            "schema_file": effective_triple_schema_file,
+            "schema_apply_mode": effective_schema_apply_mode,
+        },
+        "build_graph": {
+            "edge_merge_mode": effective_edge_merge_mode,
+            "node_merge_mode": effective_node_merge_mode,
+            "node_scope_with_type": effective_node_scope_with_type,
+        },
+        "build_communities": {
+            "resolutions": effective_resolutions,
+            "min_parent_overlap": effective_min_parent_overlap,
+            "summary_level_max": effective_summary_level_max,
+            "summary_min_size": effective_summary_min_size,
+            "summary_top_per_level": effective_summary_top_per_level,
+            "summary_min_per_level": effective_summary_min_per_level,
+        },
+    }
     return metrics
 
 
 def _ensure_youtu_graph_assets(
     *,
     chunks_file: str,
+    youtu_corpus_source_file: str | None,
     triples_file: str,
     graph_file: str,
     communities_file: str,
@@ -334,25 +769,32 @@ def _ensure_youtu_graph_assets(
     shared_corpus_dir: str,
     construct_poll_sec: int,
     construct_timeout_sec: int,
+    require_fingerprint_match: bool = True,
 ) -> dict:
     """Ensure youtu-graphrag backend has current graph assets.
 
-    Uses fingerprint-based caching to avoid redundant rebuilds.
+    Prefer backend-ready dataset reuse; fall back to fingerprint-based rebuild.
     Never overwrites local baseline graph/communities files
     (export_youtu_artifacts is always False here).
     """
     Path(graph_state_file).parent.mkdir(parents=True, exist_ok=True)
+    youtu_client = YoutuClient(
+        base_url=youtu_base_url,
+        timeout_sec=max(120, int(construct_timeout_sec)),
+    )  # type: ignore[name-defined]
+
+    source_file = str(youtu_corpus_source_file or chunks_file)
 
     # sync_mode is excluded from build_params intentionally: it controls how data is
     # transferred, not what data is used.  Including it would cause cache misses when
     # switching between "shared_dir" (first sync) and "none" (subsequent runs).
-    build_params = {"dataset": youtu_dataset, "chunks_file": chunks_file}
+    build_params = {"dataset": youtu_dataset, "chunks_file": source_file}
     if youtu_schema is not None:
         build_params["schema_sha256"] = youtu_schema_meta.get("schema_sha256")
         build_params["schema_file"] = youtu_schema_meta.get("schema_file")
     decision = decide_graph_reuse(  # type: ignore[name-defined]
         graph_state_file=graph_state_file,
-        chunks_file=chunks_file,
+        chunks_file=source_file,
         dataset=youtu_dataset,
         build_params=build_params,
         reuse_graph=reuse_graph,
@@ -360,23 +802,83 @@ def _ensure_youtu_graph_assets(
         require_local_assets=False,
     )
 
+    backend_ready: bool | None = None
+    backend_status = ""
+    backend_list_error = ""
+    try:
+        datasets = youtu_client.list_datasets()
+        matched = [x for x in datasets if str(x.get("name", "")).strip() == str(youtu_dataset).strip()]
+        if matched:
+            backend_status = str(matched[0].get("status", "")).strip().lower()
+            backend_ready = backend_status == "ready"
+        else:
+            backend_status = "missing"
+            backend_ready = False
+    except Exception as exc:  # noqa: BLE001
+        backend_list_error = str(exc)
+        backend_status = "unknown"
+        backend_ready = None
+
     result: dict = {
         "graph_reuse": {
             "used_cached_graph": bool(decision["used_cached_graph"]),
             "reason": decision["reason"],
             "fingerprint": decision["fingerprint"],
         },
+        "corpus_source_file": source_file,
         "youtu_schema": youtu_schema_meta,
     }
 
-    if decision["used_cached_graph"]:
-        result["youtu_construct"] = {"skipped": True}
-        result["youtu_sync"] = {"sync_mode": "none", "skipped": True}
+    # Safety policy: never trigger backend sync/construct unless explicitly forced.
+    if not force_rebuild:
+        alignment_mismatch = bool(require_fingerprint_match and (not bool(decision.get("used_cached_graph"))))
+        if backend_list_error:
+            _progress(
+                "youtu rebuild skipped by policy (force_rebuild=false); "
+                f"backend status check failed: {backend_list_error}"
+            )
+        else:
+            _progress(
+                "youtu rebuild skipped by policy (force_rebuild=false); "
+                f"backend_dataset_status={backend_status or 'unknown'}"
+            )
+        result["policy"] = {"rebuild_only_when_forced": True}
+        result["backend_dataset_status"] = backend_status or "unknown"
+        result["backend_dataset_ready"] = backend_ready
+        result["backend_status_check_error"] = backend_list_error
+        result["alignment_mismatch"] = alignment_mismatch
+        result["youtu_sync"] = {
+            "sync_mode": "none",
+            "skipped": True,
+            "reason": "policy_skip_no_force_rebuild",
+        }
+        result["youtu_construct"] = {
+            "skipped": True,
+            "reason": "policy_skip_no_force_rebuild",
+        }
         return result
 
-    youtu_client = YoutuClient(base_url=youtu_base_url, timeout_sec=120)  # type: ignore[name-defined]
+    if decision["used_cached_graph"]:
+        if backend_ready is not True:
+            _progress("local youtu cache hit but backend dataset is not ready; forcing sync+construct")
+        else:
+            result["youtu_construct"] = {"skipped": True}
+            result["youtu_sync"] = {"sync_mode": "none", "skipped": True}
+            return result
+
+    if str(sync_mode).strip().lower() == "none":
+        # Safety guard: if construct is required, sync_mode=none means backend will directly
+        # read `source_file` as corpus.json. That file must be a JSON array (not JSONL).
+        if not _is_json_array_file(source_file):
+            raise RuntimeError(
+                "YouTu construct is required, but sync_mode=none with a non-JSON-array corpus source. "
+                f"source_file={source_file}. "
+                "Use --youtu-sync-mode shared_dir for jsonl sources, or reuse ready backend dataset with "
+                "--youtu-require-fingerprint-match false (when appropriate)."
+            )
+
     sync_meta = sync_chunks_to_youtu_dataset(  # type: ignore[name-defined]
-        chunks_file=chunks_file,
+        chunks_file=source_file,
         dataset=youtu_dataset,
         sync_mode=sync_mode,
         shared_dir=shared_corpus_dir,
@@ -385,23 +887,83 @@ def _ensure_youtu_graph_assets(
 
     import time as _time
     construct_started = _time.time()
+    chunks_source_value = sync_meta.get("written_file") or sync_meta.get("chunks_source")
+    if chunks_source_value:
+        chunks_source_value = _abs_path(str(chunks_source_value))
+
     construct_kwargs = {
         "dataset_name": youtu_dataset,
-        "chunks_source": sync_meta.get("written_file") or sync_meta.get("chunks_source"),
+        "chunks_source": chunks_source_value,
         "chunks_fingerprint": decision["fingerprint"],
     }
     if youtu_schema is not None:
         construct_kwargs["schema"] = youtu_schema
     task_id = youtu_client.construct_graph(**construct_kwargs)
-    final_status = youtu_client.poll_construct(
-        task_id=task_id,
-        timeout_sec=construct_timeout_sec,
-        poll_sec=construct_poll_sec,
-    )
+    poll_error: str | None = None
+    try:
+        final_status = youtu_client.poll_construct(
+            task_id=task_id,
+            timeout_sec=construct_timeout_sec,
+            poll_sec=construct_poll_sec,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Tolerate transient connection resets during long-running backend construction.
+        # Do NOT treat dataset-level "ready" as completion; only task status can mark done.
+        poll_error = str(exc)
+        _progress(f"youtu construct poll failed; fallback to task-status polling: {poll_error}")
+        final_status = None
+        deadline = _time.time() + max(10, int(construct_timeout_sec))
+        last_status_error = ""
+        last_status_payload: dict = {}
+        done_states = {"done", "completed", "success", "succeeded", "finished"}
+        fail_states = {"failed", "error", "cancelled", "canceled"}
+        while _time.time() < deadline:
+            try:
+                status_payload = youtu_client.get_construct_status(task_id=task_id)
+                if isinstance(status_payload, dict):
+                    last_status_payload = status_payload
+                else:
+                    last_status_payload = {"data": status_payload}
+                raw_state = ""
+                for keys in (("status",), ("data", "status"), ("data", "state"), ("state",)):
+                    cur = last_status_payload
+                    ok = True
+                    for k in keys:
+                        if not isinstance(cur, dict):
+                            ok = False
+                            break
+                        cur = cur.get(k)
+                    if ok and cur is not None:
+                        raw_state = str(cur).strip().lower()
+                        if raw_state:
+                            break
+                if raw_state in done_states:
+                    final_status = dict(last_status_payload)
+                    final_status["source"] = "task_status_fallback"
+                    final_status["poll_error"] = poll_error
+                    break
+                if raw_state in fail_states:
+                    raise RuntimeError(
+                        f"YouTu construct task failed during fallback polling: task_id={task_id}, payload={last_status_payload}"
+                    )
+            except Exception as status_exc:  # noqa: BLE001
+                last_status_error = str(status_exc)
+            _time.sleep(max(1, int(construct_poll_sec)))
+        if final_status is None:
+            if last_status_error:
+                raise RuntimeError(
+                    "YouTu construct polling failed and task-status fallback also failed: "
+                    f"poll_error={poll_error}; status_error={last_status_error}; last_status={last_status_payload}"
+                ) from exc
+            raise RuntimeError(
+                "YouTu construct polling failed and task did not reach done before timeout: "
+                f"poll_error={poll_error}; last_status={last_status_payload}"
+            ) from exc
     result["youtu_construct"] = {
         "task_id": task_id,
         "elapsed_sec": round(_time.time() - construct_started, 3),
         "final_status": final_status,
+        "build_stats": _extract_youtu_construct_build_stats(final_status if isinstance(final_status, dict) else {}),
     }
 
     state_payload = build_state_payload(  # type: ignore[name-defined]
@@ -409,7 +971,7 @@ def _ensure_youtu_graph_assets(
         fingerprint=decision["fingerprint"],
         build_params={
             "dataset": youtu_dataset,
-            "chunks_source": sync_meta.get("written_file") or sync_meta.get("chunks_source"),
+            "chunks_source": chunks_source_value,
             "chunks_fingerprint": decision["fingerprint"],
             "sync_mode": sync_meta.get("sync_mode", sync_mode),
             "schema_sha256": youtu_schema_meta.get("schema_sha256"),
@@ -472,7 +1034,11 @@ def _load_indexing_metrics(graph_build_metrics: dict) -> dict:
     }
 
 
-def _regime_settings(top_k: int, budget_cfg_yaml: dict | None = None) -> dict[str, dict]:
+def _regime_settings(
+    top_k: int,
+    budget_cfg_yaml: dict | None = None,
+    graph_query_level_override: int | None = None,
+) -> dict[str, dict]:
     comp = getattr(cfg, "comparison", None)
     best = getattr(comp, "best_effort", None)
     budget = getattr(comp, "budget_matched", None)
@@ -493,6 +1059,10 @@ def _regime_settings(top_k: int, budget_cfg_yaml: dict | None = None) -> dict[st
                 "max_nodes": int(_g(best_kg, "max_nodes", 0)) or None,
                 "use_entity_linking": True,
                 "use_embedding_rerank": True,
+                "dynamic_early_stop": bool(_g(best_kg, "dynamic_early_stop", True)),
+                "min_hops_before_stop": int(_g(best_kg, "min_hops_before_stop", 1)),
+                "relevance_threshold": float(_g(best_kg, "relevance_threshold", 0.35)),
+                "coverage_threshold": float(_g(best_kg, "coverage_threshold", 0.6)),
             },
             "graph_kwargs": {
                 "top_communities": int(_g(best_graph, "top_communities", 3)),
@@ -519,6 +1089,10 @@ def _regime_settings(top_k: int, budget_cfg_yaml: dict | None = None) -> dict[st
                 "max_nodes": int(_g(budget_kg, "max_nodes", 30)),
                 "use_entity_linking": True,
                 "use_embedding_rerank": True,
+                "dynamic_early_stop": bool(_g(budget_kg, "dynamic_early_stop", True)),
+                "min_hops_before_stop": int(_g(budget_kg, "min_hops_before_stop", 1)),
+                "relevance_threshold": float(_g(budget_kg, "relevance_threshold", 0.35)),
+                "coverage_threshold": float(_g(budget_kg, "coverage_threshold", 0.6)),
             },
             "graph_kwargs": {
                 "top_communities": int(_g(budget_graph, "top_communities", 1)),
@@ -564,6 +1138,9 @@ def _regime_settings(top_k: int, budget_cfg_yaml: dict | None = None) -> dict[st
         y_adaptive_retry = (y_budget.get("graph") or {}).get("adaptive_retry")
         if y_adaptive_retry is not None:
             out["budget_matched"]["graph_budget_adaptive_retry"] = _parse_bool(y_adaptive_retry)
+    if graph_query_level_override is not None:
+        for rg in ("best_effort", "budget_matched"):
+            out[rg]["graph_kwargs"]["query_level"] = int(graph_query_level_override)
     return out
 
 
@@ -620,35 +1197,130 @@ def run_compare(
     warmup_graphrag: bool = True,
     max_queries: int | None = None,
     include_youtu: bool = False,
-    youtu_base_url: str = "http://127.0.0.1:8080",
+    include_lightrag: bool = False,
+    lightrag_mode: str = "hybrid",
+    lightrag_working_dir: str | None = None,
+    lightrag_force_rebuild: bool = False,
+    youtu_base_url: str = "http://127.0.0.1:8000",
     youtu_dataset: str = "enterprise",
+    youtu_route_type: str | None = None,
+    youtu_client_id: str | None = None,
     youtu_graph_state_file: str = "outputs/graph/youtu_graph_state.json",
     youtu_reuse_graph: bool = True,
     youtu_force_rebuild: bool = False,
     youtu_sync_mode: str = "none",
     youtu_shared_corpus_dir: str = "outputs/youtu_sync",
+    youtu_corpus_source_file: str | None = None,
     youtu_construct_poll_sec: int = 2,
     youtu_construct_timeout_sec: int = 1800,
+    youtu_require_fingerprint_match: bool = True,
     youtu_schema_file: str | None = None,
+    cuad_doc_scope: bool = False,
+    strict_doc_scope: bool = True,
+    graph_edge_merge_mode: str = "global",
+    graph_node_merge_mode: str = "normalized",
+    graph_node_scope_with_type: bool = True,
+    graph_query_level: int | None = None,
+    triple_schema_file: str | None = "config_triple_schema.json",
+    schema_apply_mode: str = "strict",
+    answer_mode: str = "reject",
+    answer_modes: str | None = None,
+    execution_mode: str = "all",
 ) -> dict:
     _progress(f"loading queries: {queries_file}")
     queries = _load_queries(queries_file)
-    _progress(f"loaded queries: {len(queries)}")
-    _progress("ensuring graph assets")
-    graph_metrics = ensure_graph_assets(chunks_file, triples_file, graph_file, communities_file)
-    _progress("graph assets ready")
+    loaded_total = len(queries)
+    if max_queries is not None and int(max_queries) > 0:
+        loaded_effective = min(loaded_total, int(max_queries))
+        _progress(
+            f"loaded queries: {loaded_total} "
+            f"(max_queries={int(max_queries)}, effective_loaded={loaded_effective})"
+        )
+    else:
+        _progress(f"loaded queries: {loaded_total}")
+    query_snapshot_before_limit = _query_consistency_snapshot(queries)
+    dataset_tag = _infer_dataset_tag(queries_file=queries_file, queries=queries)
+    resolved_answer_modes = _resolve_answer_modes(answer_mode=answer_mode, answer_modes=answer_modes)
+    exec_mode = str(execution_mode or "all").strip().lower()
+    if exec_mode not in {"all", "only_youtu"}:
+        raise ValueError("execution_mode must be one of: all, only_youtu")
+    run_only_youtu = exec_mode == "only_youtu"
+    if run_only_youtu and not include_youtu:
+        raise ValueError("execution_mode=only_youtu requires --include-youtu")
+    effective_youtu_route_type = _normalize_youtu_route_type(youtu_route_type)
+    effective_youtu_client_id = str(youtu_client_id or "").strip()
+    _progress(f"answer modes: {resolved_answer_modes}")
+    _progress(f"execution mode: {exec_mode}")
+    _progress(f"youtu route type: {effective_youtu_route_type or 'default(auto)'}")
+    _progress(f"youtu client id: {effective_youtu_client_id or 'none'}")
+    _progress(
+        "query consistency "
+        + json.dumps(
+            {
+                "dataset_tag": dataset_tag,
+                "total_queries": query_snapshot_before_limit["total_queries"],
+                "unique_qids": query_snapshot_before_limit["unique_qids"],
+                "duplicate_qids": query_snapshot_before_limit["duplicate_qids"],
+                "missing_query_text": query_snapshot_before_limit["missing_query_text"],
+            },
+            ensure_ascii=False,
+        )
+    )
+    use_cuad_doc_scope = (dataset_tag in {"cuad", "cuad_like"}) and bool(cuad_doc_scope)
+    _progress(
+        "cuad_doc_scope "
+        + json.dumps(
+            {
+                "configured": bool(cuad_doc_scope),
+                "effective": bool(use_cuad_doc_scope),
+            },
+            ensure_ascii=False,
+        )
+    )
+    graph_metrics: dict = {}
+    if run_only_youtu:
+        _progress("execution mode only_youtu: skipping local graph asset build")
+    else:
+        _progress("ensuring graph assets")
+        graph_metrics = ensure_graph_assets(
+            chunks_file,
+            triples_file,
+            graph_file,
+            communities_file,
+            graph_edge_merge_mode=graph_edge_merge_mode,
+            graph_node_merge_mode=graph_node_merge_mode,
+            graph_node_scope_with_type=graph_node_scope_with_type,
+            triple_schema_file=triple_schema_file,
+            schema_apply_mode=schema_apply_mode,
+        )
+        _progress("graph assets ready")
 
     youtu_graph_metrics: dict = {}
+    youtu_source_file_effective = ""
     if include_youtu:
         if not _YOUTU_AVAILABLE:
+            if run_only_youtu:
+                raise RuntimeError(
+                    "execution_mode=only_youtu but youtu adapters are not importable; cannot run youtu-only compare"
+                )
             _progress("WARNING: include_youtu=True but youtu adapters not importable; youtu branch disabled")
             include_youtu = False
         else:
+            youtu_source_file = str(youtu_corpus_source_file or "").strip()
+            if not youtu_source_file and dataset_tag in {"cuad", "cuad_like"}:
+                default_cuad_docs = Path("data/processed/cuad_docs.jsonl")
+                if default_cuad_docs.exists():
+                    youtu_source_file = str(default_cuad_docs)
+            if not youtu_source_file:
+                youtu_source_file = chunks_file
+            youtu_source_file_effective = youtu_source_file
             youtu_schema, youtu_schema_meta = load_and_adapt_schema(youtu_schema_file)  # type: ignore[name-defined]
             _progress(f"youtu schema config: {json.dumps(youtu_schema_meta, ensure_ascii=False)}")
+            _progress(f"youtu corpus source: {youtu_source_file}")
             _progress("ensuring youtu graph assets")
             youtu_graph_metrics = _ensure_youtu_graph_assets(
                 chunks_file=chunks_file,
+                youtu_corpus_source_file=youtu_source_file,
                 triples_file=triples_file,
                 graph_file=graph_file,
                 communities_file=communities_file,
@@ -663,11 +1335,12 @@ def run_compare(
                 shared_corpus_dir=youtu_shared_corpus_dir,
                 construct_poll_sec=youtu_construct_poll_sec,
                 construct_timeout_sec=youtu_construct_timeout_sec,
+                require_fingerprint_match=youtu_require_fingerprint_match,
             )
             _progress(f"youtu graph assets ready: {json.dumps(youtu_graph_metrics, ensure_ascii=False)}")
 
     regime_names = _resolve_regimes(regimes)
-    _base_methods = ["vector_rag", "kg_rag", "graph_rag"]
+    _base_methods = ["vector_rag", "kg_rag", "graph_rag"] + (["lightrag"] if include_lightrag else [])
     _all_methods = _base_methods + (["youtu_graph_rag"] if include_youtu else [])
     _progress(f"regimes: {regime_names}")
     _progress(f"loading budget config: {budget_config_file}")
@@ -685,13 +1358,61 @@ def run_compare(
         budget["max_completion_tokens"] = int(yaml_budget.get("max_completion_tokens", budget["max_completion_tokens"]))
         budget["max_total_tokens"] = int(yaml_budget.get("max_total_tokens", budget["max_total_tokens"]))
         budget["max_llm_calls"] = int(yaml_budget.get("max_llm_calls", budget["max_llm_calls"]))
-    settings = _regime_settings(top_k=top_k, budget_cfg_yaml=budget_yaml)
+    settings = _regime_settings(
+        top_k=top_k,
+        budget_cfg_yaml=budget_yaml,
+        graph_query_level_override=graph_query_level,
+    )
+    max_summary_level = _detect_max_precomputed_summary_level(communities_file)
+    if max_summary_level is not None and graph_query_level is None:
+        for rg in regime_names:
+            gk = settings[rg]["graph_kwargs"]
+            if bool(gk.get("use_community_summaries", True)):
+                cur_level = int(gk.get("query_level", 0))
+                if cur_level < 0:
+                    gk["query_level"] = max_summary_level
+                    _progress(
+                        f"regime={rg} graph query_level set from {cur_level} to {max_summary_level} "
+                        "to align with precomputed summaries"
+                    )
+                    continue
+                if cur_level > max_summary_level:
+                    gk["query_level"] = max_summary_level
+                    _progress(
+                        f"regime={rg} graph query_level clamped from {cur_level} to {max_summary_level} "
+                        "to match precomputed summary coverage"
+                    )
     tokenizer = TokenizerProvider(
         backend=cfg.llm.backend,
         model_name=(cfg.llm.api.model if cfg.llm.backend == "api" else cfg.llm.local.model),
     )
+
+    existing_rows: list[dict] = _load_jsonl(out_file) if (incremental_only or include_youtu or run_only_youtu) else []
+    if run_only_youtu and not existing_rows:
+        seeded_rows: list[dict] = []
+        for q in queries:
+            for mode in resolved_answer_modes:
+                seeded_rows.append(
+                    {
+                        "qid": q.get("qid"),
+                        "type": q.get("type", "unknown"),
+                        "query": q.get("query", ""),
+                        "mode": _normalize_answer_mode(mode),
+                        "top_k": int(top_k),
+                        "meta": (q.get("meta") if isinstance(q.get("meta"), dict) else {}),
+                        "regimes": {},
+                    }
+                )
+        existing_rows = seeded_rows
+        _progress(f"only_youtu seed rows prepared: {len(existing_rows)}")
+    youtu_backfill_only_mode = bool(include_youtu and (existing_rows or run_only_youtu))
+    if youtu_backfill_only_mode:
+        _progress(
+            "youtu backfill mode enabled: out-file exists, only youtu branch will run and existing methods will be reused"
+        )
+
     warmup_info: dict[str, dict] = {}
-    if warmup_graphrag:
+    if warmup_graphrag and not youtu_backfill_only_mode and not run_only_youtu:
         _progress("warming up graphrag before retrieval comparison")
         warmup_info = _warmup_graphrag(
             regime_names=regime_names,
@@ -701,10 +1422,8 @@ def run_compare(
             communities_file=communities_file,
         )
         _progress(f"graphrag warmup done: {json.dumps(warmup_info, ensure_ascii=False)}")
-
-    existing_rows: list[dict] = _load_jsonl(out_file) if incremental_only else []
     rows: list[dict] = list(existing_rows)
-    if incremental_only:
+    if incremental_only and not youtu_backfill_only_mode:
         filtered_queries: list[dict] = []
         keep_row_indexes: set[int] = set()
         for i, r in enumerate(existing_rows):
@@ -716,34 +1435,94 @@ def run_compare(
         for q in queries:
             qid = str(q.get("qid", "")).strip()
             qtext = str(q.get("query", "")).strip().lower()
+            for mode in resolved_answer_modes:
+                matched_idx = _find_matching_row_idx(
+                    existing_rows=existing_rows,
+                    qid=qid,
+                    qtext=qtext,
+                    answer_mode=mode,
+                )
 
-            matched_idx = -1
-            if qid:
-                for i, r in enumerate(existing_rows):
-                    if str(r.get("qid", "")).strip() == qid:
-                        matched_idx = i
-                        break
-            if matched_idx < 0 and qtext:
-                for i, r in enumerate(existing_rows):
-                    if str(r.get("query", "")).strip().lower() == qtext:
-                        matched_idx = i
-                        break
-
-            if matched_idx >= 0 and _row_is_complete_for_compare(
-                existing_rows[matched_idx], regime_names=regime_names, methods=_all_methods
-            ):
-                continue
-            filtered_queries.append(q)
+                if matched_idx >= 0 and _row_is_complete_for_compare(
+                    existing_rows[matched_idx], regime_names=regime_names, methods=_all_methods
+                ):
+                    continue
+                qq = dict(q)
+                qq["__answer_mode"] = mode
+                filtered_queries.append(qq)
 
         rows = [existing_rows[i] for i in sorted(keep_row_indexes)]
         _progress(
             f"incremental mode: existing={len(existing_rows)}, pending={len(filtered_queries)}, skipped={len(queries) - len(filtered_queries)}"
         )
         queries = filtered_queries
+    elif youtu_backfill_only_mode:
+        filtered_queries: list[dict] = []
+        skipped_completed = 0
+        skipped_unmatched = 0
+        for q in queries:
+            qid = str(q.get("qid", "")).strip()
+            qtext = str(q.get("query", "")).strip().lower()
+            for mode in resolved_answer_modes:
+                matched_idx = _find_matching_row_idx(
+                    existing_rows=existing_rows,
+                    qid=qid,
+                    qtext=qtext,
+                    answer_mode=mode,
+                )
+
+                if matched_idx < 0:
+                    skipped_unmatched += 1
+                    continue
+
+                if _row_is_complete_for_compare(
+                    existing_rows[matched_idx], regime_names=regime_names, methods=_all_methods
+                ):
+                    skipped_completed += 1
+                    continue
+
+                qq = dict(q)
+                qq["__answer_mode"] = mode
+                qq["__existing_row_idx"] = matched_idx
+                filtered_queries.append(qq)
+
+        queries = filtered_queries
+        _progress(
+            "youtu backfill scope "
+            + json.dumps(
+                {
+                    "existing_rows": len(existing_rows),
+                    "pending_backfill": len(queries),
+                    "skipped_completed": skipped_completed,
+                    "skipped_unmatched": skipped_unmatched,
+                },
+                ensure_ascii=False,
+            )
+        )
+    else:
+        expanded_queries: list[dict] = []
+        for q in queries:
+            for mode in resolved_answer_modes:
+                qq = dict(q)
+                qq["__answer_mode"] = mode
+                expanded_queries.append(qq)
+        queries = expanded_queries
 
     if max_queries is not None and int(max_queries) > 0:
         queries = queries[: int(max_queries)]
         _progress(f"max_queries applied: processing={len(queries)}")
+    query_snapshot_effective = _query_consistency_snapshot(queries)
+    _progress(
+        "effective query scope "
+        + json.dumps(
+            {
+                "before_limit": query_snapshot_before_limit["total_queries"],
+                "effective": query_snapshot_effective["total_queries"],
+                "max_queries": max_queries,
+            },
+            ensure_ascii=False,
+        )
+    )
 
     new_rows: list[dict] = []
     aggregate: dict[str, dict[str, Telemetry]] = {
@@ -756,16 +1535,34 @@ def run_compare(
     }
 
     for idx, q in enumerate(queries, start=1):
+        row_answer_mode = _normalize_answer_mode(q.get("__answer_mode"))
         query = q["query"]
+        query_doc_key = _extract_query_doc_key(q)
+        scoped_query = _scope_query_for_cuad(query, query_doc_key, dataset_tag, enabled=use_cuad_doc_scope)
         qid = q.get("qid")
         qtype = q.get("type", "unknown")
-        _progress(f"query {idx}/{len(queries)} start: qid={qid} type={qtype}")
-        row = {
-            "qid": qid,
-            "type": qtype,
-            "query": query,
-            "regimes": {},
-        }
+        _progress(f"query {idx}/{len(queries)} start: qid={qid} type={qtype} mode={row_answer_mode}")
+        existing_row_idx = q.get("__existing_row_idx") if youtu_backfill_only_mode else None
+        if isinstance(existing_row_idx, int) and 0 <= existing_row_idx < len(rows):
+            row = rows[existing_row_idx]
+            row.setdefault("regimes", {})
+            row["mode"] = _normalize_answer_mode(row.get("mode", row_answer_mode))
+            row["top_k"] = int(row.get("top_k", top_k) or top_k)
+            query = str(row.get("query", query))
+            qid = row.get("qid", qid)
+            qtype = row.get("type", qtype)
+            query_doc_key = _extract_query_doc_key(row)
+            scoped_query = _scope_query_for_cuad(query, query_doc_key, dataset_tag, enabled=use_cuad_doc_scope)
+        else:
+            row = {
+                "qid": qid,
+                "type": qtype,
+                "query": query,
+                "mode": row_answer_mode,
+                "top_k": int(top_k),
+                "meta": (q.get("meta") if isinstance(q.get("meta"), dict) else {}),
+                "regimes": {},
+            }
         for rg in regime_names:
             _progress(f"query {idx}/{len(queries)} regime={rg}: start")
             is_budget = rg == "budget_matched"
@@ -784,12 +1581,12 @@ def run_compare(
                 kg_manager = None
                 graph_manager = None
 
-            _progress(f"query {idx}/{len(queries)} regime={rg}: running 3 branches in parallel")
             branch_results: dict[str, dict | tuple[dict, dict]] = {}
 
             def _run_vector_branch() -> tuple[dict, dict]:
                 return _run_vector(
-                    query=query,
+                    query=scoped_query,
+                    query_type=str(qtype),
                     idx_file=idx_file,
                     store_file=store_file,
                     top_k=vector_top_k,
@@ -797,83 +1594,145 @@ def run_compare(
                     max_chunks=vector_top_k if is_budget else None,
                     max_completion_tokens=budget["max_completion_tokens"] if is_budget else None,
                     budget_manager=vector_manager,
+                    doc_prefix_filter=(query_doc_key if use_cuad_doc_scope else None),
+                    answer_mode=row_answer_mode,
                 )
 
             def _run_kg_branch() -> dict:
                 return answer_with_kg(
-                    query=query,
+                    query=scoped_query,
                     graph_file=graph_file,
                     store_file=store_file,
                     max_completion_tokens=budget["max_completion_tokens"] if is_budget else None,
+                    doc_prefix_filter=(query_doc_key if use_cuad_doc_scope else None),
+                    strict_doc_scope=(strict_doc_scope and use_cuad_doc_scope),
+                    query_type=str(qtype),
+                    answer_mode=row_answer_mode,
                     **kg_kwargs,
                 )
 
             def _run_graph_branch() -> dict:
                 return answer_with_graphrag(
-                    query=query,
+                    query=scoped_query,
                     graph_file=graph_file,
                     communities_file=communities_file,
                     max_completion_tokens=budget["max_completion_tokens"] if is_budget else None,
+                    doc_prefix_filter=(query_doc_key if use_cuad_doc_scope else None),
+                    strict_doc_scope=(strict_doc_scope and use_cuad_doc_scope),
+                    query_type=str(qtype),
+                    answer_mode=row_answer_mode,
                     **graph_kwargs,
+                )
+
+            def _run_lightrag_branch() -> dict:
+                return answer_with_lightrag(
+                    query=scoped_query,
+                    chunks_file=chunks_file,
+                    top_k=vector_top_k,
+                    max_completion_tokens=budget["max_completion_tokens"] if is_budget else None,
+                    answer_mode=row_answer_mode,
+                    query_type=str(qtype),
+                    working_dir=lightrag_working_dir,
+                    lightrag_mode=lightrag_mode,
+                    force_rebuild=bool(lightrag_force_rebuild),
                 )
 
             def _run_youtu_branch() -> dict:
                 return answer_with_youtu_graphrag(  # type: ignore[name-defined]
-                    query=query,
+                    query=scoped_query,
                     graph_file=graph_file,
                     communities_file=communities_file,
+                    store_file=store_file,
                     max_completion_tokens=budget["max_completion_tokens"] if is_budget else None,
                     youtu_base_url=youtu_base_url,
                     youtu_dataset=youtu_dataset,
+                    doc_prefix_filter=(query_doc_key if use_cuad_doc_scope else None),
+                    strict_doc_scope=(strict_doc_scope and use_cuad_doc_scope),
+                    answer_mode=row_answer_mode,
+                    route_type=effective_youtu_route_type or None,
+                    client_id=effective_youtu_client_id or None,
                     **graph_kwargs,
                 )
 
-            _max_workers = 4 if include_youtu else 3
-            with ThreadPoolExecutor(max_workers=_max_workers) as executor:
-                futures = {
-                    executor.submit(_run_vector_branch): "vector_rag",
-                    executor.submit(_run_kg_branch): "kg_rag",
-                    executor.submit(_run_graph_branch): "graph_rag",
-                }
-                if include_youtu:
-                    futures[executor.submit(_run_youtu_branch)] = "youtu_graph_rag"
-                for future in as_completed(futures):
-                    name = futures[future]
-                    try:
-                        branch_results[name] = future.result()
-                        _progress(f"query {idx}/{len(queries)} regime={rg}: {name} done")
-                    except Exception as exc:  # noqa: BLE001
-                        _progress(f"query {idx}/{len(queries)} regime={rg}: {name} failed: {exc}")
-                        if name == "vector_rag":
-                            branch_results[name] = (
-                                {
+            if youtu_backfill_only_mode:
+                existing_regime = {}
+                regimes_payload = row.get("regimes")
+                if isinstance(regimes_payload, dict):
+                    maybe_payload = regimes_payload.get(rg)
+                    if isinstance(maybe_payload, dict):
+                        existing_regime = maybe_payload
+                vector_out = existing_regime.get("vector_rag") if isinstance(existing_regime, dict) else None
+                kg_out = existing_regime.get("kg_rag") if isinstance(existing_regime, dict) else None
+                graph_out = existing_regime.get("graph_rag") if isinstance(existing_regime, dict) else None
+                lightrag_out = existing_regime.get("lightrag") if isinstance(existing_regime, dict) else None
+                if not isinstance(vector_out, dict):
+                    vector_out = {"answer": "", "evidence": [], "telemetry": {"embedding": {}, "generation": {}, "aggregate": {}}}
+                if not isinstance(kg_out, dict):
+                    kg_out = {"answer": "", "telemetry": {}}
+                if not isinstance(graph_out, dict):
+                    graph_out = {"answer": "", "telemetry": {}}
+                if not isinstance(lightrag_out, dict):
+                    lightrag_out = {"answer": "", "telemetry": {}}
+                try:
+                    youtu_out = _run_youtu_branch()
+                    _progress(f"query {idx}/{len(queries)} regime={rg}: youtu_graph_rag done")
+                except Exception as exc:  # noqa: BLE001
+                    _progress(f"query {idx}/{len(queries)} regime={rg}: youtu_graph_rag failed: {exc}")
+                    youtu_out = {"answer": "", "error": str(exc), "telemetry": {}}
+                vector_t = _extract_method_telemetry("vector_rag", vector_out)
+            else:
+                _progress(f"query {idx}/{len(queries)} regime={rg}: running branches in parallel")
+                _max_workers = 3 + int(include_youtu) + int(include_lightrag)
+                with ThreadPoolExecutor(max_workers=_max_workers) as executor:
+                    futures = {
+                        executor.submit(_run_vector_branch): "vector_rag",
+                        executor.submit(_run_kg_branch): "kg_rag",
+                        executor.submit(_run_graph_branch): "graph_rag",
+                    }
+                    if include_lightrag:
+                        futures[executor.submit(_run_lightrag_branch)] = "lightrag"
+                    if include_youtu:
+                        futures[executor.submit(_run_youtu_branch)] = "youtu_graph_rag"
+                    for future in as_completed(futures):
+                        name = futures[future]
+                        try:
+                            branch_results[name] = future.result()
+                            _progress(f"query {idx}/{len(queries)} regime={rg}: {name} done")
+                        except Exception as exc:  # noqa: BLE001
+                            _progress(f"query {idx}/{len(queries)} regime={rg}: {name} failed: {exc}")
+                            if name == "vector_rag":
+                                branch_results[name] = (
+                                    {
+                                        "answer": "",
+                                        "evidence": [],
+                                        "error": str(exc),
+                                        "telemetry": {"embedding": {}, "generation": {}, "aggregate": {}},
+                                    },
+                                    {},
+                                )
+                            else:
+                                branch_results[name] = {
                                     "answer": "",
-                                    "evidence": [],
                                     "error": str(exc),
-                                    "telemetry": {"embedding": {}, "generation": {}, "aggregate": {}},
-                                },
-                                {},
-                            )
-                        else:
-                            branch_results[name] = {
-                                "answer": "",
-                                "error": str(exc),
-                                "telemetry": {},
-                            }
+                                    "telemetry": {},
+                                }
 
-            vector_out, vector_t = branch_results["vector_rag"]  # type: ignore[assignment]
-            kg_out = branch_results["kg_rag"]  # type: ignore[assignment]
-            graph_out = branch_results["graph_rag"]  # type: ignore[assignment]
-            youtu_out = branch_results.get("youtu_graph_rag") if include_youtu else None
+                vector_out, vector_t = branch_results["vector_rag"]  # type: ignore[assignment]
+                kg_out = branch_results["kg_rag"]  # type: ignore[assignment]
+                graph_out = branch_results["graph_rag"]  # type: ignore[assignment]
+                lightrag_out = branch_results.get("lightrag") if include_lightrag else None
+                youtu_out = branch_results.get("youtu_graph_rag") if include_youtu else None
 
             vector_agg_t = vector_t
             kg_agg_t = kg_out.get("telemetry", {})
             graph_agg_t = graph_out.get("telemetry", {})
+            lightrag_agg_t = lightrag_out.get("telemetry", {}) if isinstance(lightrag_out, dict) else {}
             youtu_agg_t = youtu_out.get("telemetry", {}) if isinstance(youtu_out, dict) else {}
 
             # Adaptive enforcement for GraphRAG under strict budget.
             if (
                 is_budget
+                and not youtu_backfill_only_mode
                 and graph_budget_adaptive_retry
                 and not _check_budget(graph_agg_t, budget).get("within_budget", False)
             ):
@@ -891,10 +1750,14 @@ def run_compare(
                     int(graph_kwargs.get("map_keypoints_limit", 5)), 3
                 )
                 graph_out = answer_with_graphrag(
-                    query=query,
+                    query=scoped_query,
                     graph_file=graph_file,
                     communities_file=communities_file,
                     max_completion_tokens=budget["max_completion_tokens"],
+                    doc_prefix_filter=(query_doc_key if use_cuad_doc_scope else None),
+                    strict_doc_scope=(strict_doc_scope and use_cuad_doc_scope),
+                    query_type=str(qtype),
+                    answer_mode=row_answer_mode,
                     **tighter_graph_kwargs,
                 )
                 graph_out["budget_adaptation"] = {
@@ -907,6 +1770,8 @@ def run_compare(
             _merge_telemetry(aggregate[rg]["vector_rag"], vector_agg_t)
             _merge_telemetry(aggregate[rg]["kg_rag"], kg_agg_t)
             _merge_telemetry(aggregate[rg]["graph_rag"], graph_agg_t)
+            if include_lightrag:
+                _merge_telemetry(aggregate[rg]["lightrag"], lightrag_agg_t)
             if include_youtu:
                 _merge_telemetry(aggregate[rg]["youtu_graph_rag"], youtu_agg_t)
 
@@ -917,6 +1782,8 @@ def run_compare(
             _merge_telemetry(by_type[rg][qtype]["vector_rag"], vector_agg_t)
             _merge_telemetry(by_type[rg][qtype]["kg_rag"], kg_agg_t)
             _merge_telemetry(by_type[rg][qtype]["graph_rag"], graph_agg_t)
+            if include_lightrag:
+                _merge_telemetry(by_type[rg][qtype]["lightrag"], lightrag_agg_t)
             if include_youtu:
                 _merge_telemetry(by_type[rg][qtype]["youtu_graph_rag"], youtu_agg_t)
 
@@ -929,6 +1796,10 @@ def run_compare(
             latency_samples[rg]["graph_rag"].append(
                 int(graph_agg_t.get("llm_latency_ms", 0)) + int(graph_agg_t.get("embedding_latency_ms", 0))
             )
+            if include_lightrag:
+                latency_samples[rg]["lightrag"].append(
+                    int(lightrag_agg_t.get("llm_latency_ms", 0)) + int(lightrag_agg_t.get("embedding_latency_ms", 0))
+                )
             if include_youtu:
                 latency_samples[rg]["youtu_graph_rag"].append(
                     int(youtu_agg_t.get("llm_latency_ms", 0)) + int(youtu_agg_t.get("embedding_latency_ms", 0))
@@ -950,6 +1821,24 @@ def run_compare(
                     graph_manager.register_from_telemetry(graph_agg_t, stage="graph_answer")
                 except RuntimeError as e:
                     g_err = str(e)
+                if include_lightrag and isinstance(lightrag_out, dict):
+                    lightrag_manager = BudgetManager(tokenizer=tokenizer, cfg=budget, method="lightrag", regime=rg)
+                    l_err = None
+                    usage_complete = bool((lightrag_agg_t.get("extra") or {}).get("usage_complete", True))
+                    if not usage_complete:
+                        l_err = "telemetry usage incomplete"
+                    try:
+                        lightrag_manager.register_from_telemetry(lightrag_agg_t, stage="lightrag_answer")
+                    except RuntimeError as e:
+                        l_err = str(e)
+                    lightrag_budget_check = _check_budget(lightrag_agg_t, budget)
+                    if not usage_complete:
+                        lightrag_budget_check["within_budget"] = False
+                    lightrag_out["budget_check"] = {
+                        **lightrag_budget_check,
+                        "manager": lightrag_manager.to_dict(),
+                        "error": l_err,
+                    }
 
                 vector_out["budget_check"] = {
                     **_check_budget(vector_agg_t, budget),
@@ -1023,6 +1912,20 @@ def run_compare(
                         ensure_ascii=False,
                     )
                 )
+                if include_lightrag:
+                    _progress(
+                        "budget usage "
+                        + json.dumps(
+                            {
+                                "method": "lightrag",
+                                "regime": rg,
+                                "llm_calls": lightrag_agg_t.get("llm_calls", 0),
+                                "prompt_tokens": lightrag_agg_t.get("prompt_tokens", 0),
+                                "completion_tokens": lightrag_agg_t.get("completion_tokens", 0),
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
                 if include_youtu:
                     _progress(
                         "budget usage "
@@ -1043,13 +1946,19 @@ def run_compare(
                 "kg_rag": kg_out,
                 "graph_rag": graph_out,
             }
+            if include_lightrag:
+                regime_row["lightrag"] = lightrag_out
             if include_youtu:
                 regime_row["youtu_graph_rag"] = youtu_out
             row["regimes"][rg] = regime_row
             _progress(f"query {idx}/{len(queries)} regime={rg}: done")
-        rows.append(row)
-        new_rows.append(row)
-        _progress(f"query {idx}/{len(queries)} done: qid={qid}")
+        if youtu_backfill_only_mode and isinstance(existing_row_idx, int) and 0 <= existing_row_idx < len(rows):
+            rows[existing_row_idx] = row
+            new_rows.append(row)
+        else:
+            rows.append(row)
+            new_rows.append(row)
+        _progress(f"query {idx}/{len(queries)} done: qid={qid} mode={row_answer_mode}")
 
     _progress(f"writing answers: {out_file}")
     _write_jsonl(out_file, rows)
@@ -1061,6 +1970,27 @@ def run_compare(
     )
 
     summary = {
+        "protocol_mode": "pure_global",
+        "dataset_tag": dataset_tag,
+        "retrieval_scope": {
+            "vector_rag": "global_index",
+            "kg_rag": "global_graph_traversal",
+            "graph_rag": "global_community_retrieval",
+            **({"lightrag": "lightrag_hybrid_retrieval"} if include_lightrag else {}),
+            **({"youtu_graph_rag": "global_community_retrieval"} if include_youtu else {}),
+        },
+        "strict_doc_scope": bool(strict_doc_scope),
+        "cuad_doc_scope": bool(cuad_doc_scope),
+        "execution_mode": exec_mode,
+        "graph_edge_merge_mode": graph_edge_merge_mode,
+        "graph_node_merge_mode": graph_node_merge_mode,
+        "graph_node_scope_with_type": bool(graph_node_scope_with_type),
+        "graph_query_level": graph_query_level,
+        "query_consistency": {
+            "before_limit": query_snapshot_before_limit,
+            "effective": query_snapshot_effective,
+            "max_queries_effective": query_snapshot_effective["total_queries"],
+        },
         "queries_file": queries_file,
         "num_queries": len(rows),
         "num_existing_answers": len(existing_rows),
@@ -1068,9 +1998,16 @@ def run_compare(
         "regimes": regime_names,
         "methods": _all_methods,
         "top_k": top_k,
+        "answer_mode": (resolved_answer_modes[0] if len(resolved_answer_modes) == 1 else "multiple"),
+        "answer_modes": resolved_answer_modes,
         "budget": budget,
         "budget_config_file": budget_config_file,
         "incremental_only": incremental_only,
+        "youtu_backfill_only_mode": youtu_backfill_only_mode,
+        "youtu_require_fingerprint_match": bool(youtu_require_fingerprint_match),
+        "youtu_corpus_source_file": youtu_source_file_effective or str(youtu_corpus_source_file or ""),
+        "youtu_route_type": effective_youtu_route_type,
+        "youtu_client_id": effective_youtu_client_id,
         "graphrag_warmup": warmup_info,
         "graph_assets_metrics": graph_metrics,
         "youtu_graph_assets_metrics": youtu_graph_metrics if include_youtu else {},
@@ -1078,17 +2015,21 @@ def run_compare(
         "graph_structure_metrics": {},
         "aggregate_metrics": aggregate_view,
         "aggregate_metrics_by_type": by_type_view,
+        "youtu_route_metrics": (_extract_youtu_route_metrics(rows=rows, regime_names=regime_names) if include_youtu else {}),
         "results_file": out_file,
     }
-    try:
-        summary["graph_structure_metrics"] = compute_graph_structure_metrics(
-            graph_file=graph_file,
-            communities_file=communities_file,
-            out_json="outputs/results/graph_structure_metrics.json",
-            out_dir="outputs/results/graph_plots",
-        )
-    except Exception as exc:
-        summary["graph_structure_metrics"] = {"error": str(exc)}
+    if run_only_youtu:
+        summary["graph_structure_metrics"] = {"skipped": True, "reason": "execution_mode_only_youtu"}
+    else:
+        try:
+            summary["graph_structure_metrics"] = compute_graph_structure_metrics(
+                graph_file=graph_file,
+                communities_file=communities_file,
+                out_json="outputs/results/graph_structure_metrics.json",
+                out_dir="outputs/results/graph_plots",
+            )
+        except Exception as exc:
+            summary["graph_structure_metrics"] = {"error": str(exc)}
     _progress(f"writing metrics: {metrics_file}")
     _write_json(metrics_file, summary)
     _progress("run_compare completed")
@@ -1100,7 +2041,9 @@ def main() -> None:
     best = getattr(comp, "best_effort", None)
     youtu_cfg = getattr(cfg, "youtu", None)
     default_top_k = int(_g(best, "vector_top_k", int(cfg.retrieval.top_k)))
-    parser = argparse.ArgumentParser(description="Run VectorRAG, KG-RAG, GraphRAG (+ optional YoutuGraphRAG) comparison")
+    parser = argparse.ArgumentParser(
+        description="Run VectorRAG, KG-RAG, GraphRAG (+ optional LightRAG / YoutuGraphRAG) comparison"
+    )
     parser.add_argument("--queries-file", default="data/queries/queries.jsonl")
     parser.add_argument("--chunks-file", default="data/processed/chunks_sampled.jsonl")
     parser.add_argument("--idx-file", default="outputs/indexes/faiss_sampled.idx")
@@ -1109,6 +2052,17 @@ def main() -> None:
     parser.add_argument("--graph-file", default="outputs/graph/graph.json")
     parser.add_argument("--communities-file", default="outputs/graph/communities.json")
     parser.add_argument("--top-k", type=int, default=default_top_k)
+    parser.add_argument(
+        "--answer-mode",
+        choices=["reject", "open"],
+        default="reject",
+        help="Single answer policy mode: reject (strict evidence) or open (allow outside knowledge).",
+    )
+    parser.add_argument(
+        "--answer-modes",
+        default="",
+        help="Comma-separated answer modes for one run, e.g. reject,open. Overrides --answer-mode when non-empty.",
+    )
     parser.add_argument("--out-file", default="outputs/results/compare_answers.jsonl")
     parser.add_argument("--metrics-file", default="outputs/results/compare_metrics.json")
     parser.add_argument(
@@ -1135,13 +2089,43 @@ def main() -> None:
     )
     # youtu-GraphRAG options (disabled by default)
     parser.add_argument(
+        "--include-lightrag",
+        action="store_true",
+        help="Include LightRAG Core as an additional comparison branch",
+    )
+    parser.add_argument(
+        "--lightrag-mode",
+        choices=["local", "global", "hybrid", "naive", "mix", "bypass"],
+        default="hybrid",
+        help="LightRAG query mode used in comparison",
+    )
+    parser.add_argument(
+        "--lightrag-working-dir",
+        default="",
+        help="Optional LightRAG working_dir; default uses outputs/lightrag/<chunks_file_stem>",
+    )
+    parser.add_argument(
+        "--lightrag-force-rebuild",
+        default="false",
+        help="Force rebuild LightRAG index storage from chunks_file (true/false)",
+    )
+    parser.add_argument(
         "--include-youtu",
         action="store_true",
         help="Include youtu-GraphRAG as a 4th comparison branch (requires youtu backend running)",
     )
-    parser.add_argument("--youtu-base-url", default=str(_g(youtu_cfg, "base_url", "http://127.0.0.1:8080")))
+    parser.add_argument("--youtu-base-url", default=str(_g(youtu_cfg, "base_url", "http://127.0.0.1:8000")))
     parser.add_argument("--youtu-dataset", default=str(_g(youtu_cfg, "dataset", "enterprise_new")))
-    parser.add_argument("--youtu-schema-file", default=str(_g(youtu_cfg, "schema_file", "config_triple_schema.json")))
+    parser.add_argument("--youtu-client-id", default=str(_g(youtu_cfg, "client_id", "")))
+    parser.add_argument(
+        "--youtu-route-type",
+        default=str(_g(youtu_cfg, "route_type", "")),
+        help="Optional fixed routing for youtu ask-question (backend-defined, e.g. local/structural/global or aliases).",
+    )
+    parser.add_argument(
+        "--youtu-schema-file",
+        default=str(_g(youtu_cfg, "schema_file", "youtu-graphrag/schemas/cuad_docs_sampled.json")),
+    )
     parser.add_argument("--youtu-graph-state-file", default="outputs/graph/youtu_graph_state.json")
     parser.add_argument("--youtu-reuse-graph", default="true")
     parser.add_argument("--youtu-force-rebuild", default="false")
@@ -1152,8 +2136,69 @@ def main() -> None:
         help="How to sync chunks to youtu backend: none (backend already has data) or shared_dir",
     )
     parser.add_argument("--youtu-shared-corpus-dir", default="outputs/youtu_sync")
+    parser.add_argument(
+        "--youtu-corpus-source-file",
+        default=str(_g(youtu_cfg, "corpus_file", "")),
+        help="Source jsonl file used to build youtu dataset corpus (supports docs/chunks jsonl). "
+        "If empty on CUAD, defaults to data/processed/cuad_docs.jsonl when available.",
+    )
     parser.add_argument("--youtu-construct-poll-sec", type=int, default=int(_g(youtu_cfg, "construct_poll_sec", 2)))
     parser.add_argument("--youtu-construct-timeout-sec", type=int, default=int(_g(youtu_cfg, "construct_timeout_sec", 1800)))
+    parser.add_argument(
+        "--youtu-require-fingerprint-match",
+        default="true",
+        help="Require youtu dataset fingerprint alignment with active chunks_file before reusing backend-ready datasets.",
+    )
+    parser.add_argument(
+        "--cuad-doc-scope",
+        default="false",
+        help="Enable CUAD single-document scope on query text and retrieval filter (true/false).",
+    )
+    parser.add_argument(
+        "--strict-doc-scope",
+        default="true",
+        help="For CUAD-style doc-scoped queries, if scope filter yields no evidence do not fallback to global pool (true/false).",
+    )
+    parser.add_argument(
+        "--graph-edge-merge-mode",
+        choices=["global", "doc_scoped"],
+        default="global",
+        help="How to merge triples into graph edges: global (subject,relation,object) or doc_scoped (also includes doc prefix).",
+    )
+    parser.add_argument(
+        "--graph-node-merge-mode",
+        choices=["exact", "casefold", "normalized"],
+        default="normalized",
+        help="How to merge entity nodes: exact text, casefold, or normalized text.",
+    )
+    parser.add_argument(
+        "--graph-node-scope-with-type",
+        default="true",
+        help="Whether node merge keys include entity type when merging nodes (true/false).",
+    )
+    parser.add_argument(
+        "--graph-query-level",
+        type=int,
+        default=None,
+        help="Force GraphRAG query level for both regimes. If unset, pipeline may auto-adjust level for summary coverage.",
+    )
+    parser.add_argument(
+        "--triple-schema-file",
+        default="config_triple_schema.json",
+        help="Schema file used in local triple extraction for graph construction.",
+    )
+    parser.add_argument(
+        "--schema-apply-mode",
+        choices=["strict", "prompt_only", "disabled"],
+        default="strict",
+        help="Schema application mode in local triple extraction.",
+    )
+    parser.add_argument(
+        "--execution-mode",
+        choices=["all", "only_youtu"],
+        default="all",
+        help="Execution mode: all (run local+optional youtu branches) or only_youtu (skip local branch execution/build).",
+    )
     args = parser.parse_args()
 
     summary = run_compare(
@@ -1172,17 +2217,36 @@ def main() -> None:
         incremental_only=args.incremental_only,
         warmup_graphrag=str(args.warmup_graphrag).strip().lower() in {"1", "true", "yes", "y", "on"},
         max_queries=args.max_queries,
+        include_lightrag=args.include_lightrag,
+        lightrag_mode=args.lightrag_mode,
+        lightrag_working_dir=(str(args.lightrag_working_dir).strip() or None),
+        lightrag_force_rebuild=_parse_bool(args.lightrag_force_rebuild),
         include_youtu=args.include_youtu,
         youtu_base_url=args.youtu_base_url,
         youtu_dataset=args.youtu_dataset,
+        youtu_client_id=(str(args.youtu_client_id).strip() or None),
+        youtu_route_type=(str(args.youtu_route_type).strip().lower() or None),
         youtu_schema_file=args.youtu_schema_file,
         youtu_graph_state_file=args.youtu_graph_state_file,
         youtu_reuse_graph=_parse_bool(args.youtu_reuse_graph),
         youtu_force_rebuild=_parse_bool(args.youtu_force_rebuild),
         youtu_sync_mode=args.youtu_sync_mode,
         youtu_shared_corpus_dir=args.youtu_shared_corpus_dir,
+        youtu_corpus_source_file=(str(args.youtu_corpus_source_file).strip() or None),
         youtu_construct_poll_sec=args.youtu_construct_poll_sec,
         youtu_construct_timeout_sec=args.youtu_construct_timeout_sec,
+        youtu_require_fingerprint_match=_parse_bool(args.youtu_require_fingerprint_match),
+        cuad_doc_scope=_parse_bool(args.cuad_doc_scope),
+        strict_doc_scope=_parse_bool(args.strict_doc_scope),
+        graph_edge_merge_mode=args.graph_edge_merge_mode,
+        graph_node_merge_mode=args.graph_node_merge_mode,
+        graph_node_scope_with_type=_parse_bool(args.graph_node_scope_with_type),
+        graph_query_level=args.graph_query_level,
+        triple_schema_file=args.triple_schema_file,
+        schema_apply_mode=args.schema_apply_mode,
+        answer_mode=args.answer_mode,
+        answer_modes=(str(args.answer_modes).strip() or None),
+        execution_mode=args.execution_mode,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

@@ -15,24 +15,39 @@ def _resolve_api_key() -> str | None:
     return os.getenv("DASHSCOPE_API_KEY")
 
 
+def _resolve_api_key_by_env(env_name: str | None) -> str | None:
+    for candidate in (env_name, "DASHSCOPE_API_KEY"):
+        if not candidate:
+            continue
+        configured = os.getenv(candidate)
+        if configured:
+            return configured
+    return None
+
+
 def llm_chat(
     messages,
     temperature: float = 0.2,
     max_tokens: int | None = None,
     return_meta: bool = False,
+    model: str | None = None,
+    backend: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    api_key_env: str | None = None,
 ):
-    backend = cfg.llm.backend
+    backend = str(backend or cfg.llm.backend)
     if backend == "local":
-        base_url = cfg.llm.local.base_url
-        model = cfg.llm.local.model
-        key = getattr(cfg.llm.local, "api_key", None)
+        base_url = str(base_url or cfg.llm.local.base_url)
+        resolved_model = str(model or cfg.llm.local.model)
+        key = api_key if api_key is not None else getattr(cfg.llm.local, "api_key", None)
     else:
-        base_url = cfg.llm.api.base_url
-        model = cfg.llm.api.model
-        key = _resolve_api_key()
+        base_url = str(base_url or cfg.llm.api.base_url)
+        resolved_model = str(model or cfg.llm.api.model)
+        key = api_key if api_key is not None else _resolve_api_key_by_env(api_key_env or cfg.llm.api.api_key_env)
         if not key:
             raise RuntimeError(
-                f"Missing LLM API key. Set {cfg.llm.api.api_key_env} "
+                f"Missing LLM API key. Set {api_key_env or cfg.llm.api.api_key_env} "
                 "or DASHSCOPE_API_KEY."
             )
 
@@ -41,7 +56,7 @@ def llm_chat(
     if key and key != "EMPTY":
         headers["Authorization"] = f"Bearer {key}"
 
-    payload = {"model": model, "messages": messages, "temperature": temperature}
+    payload = {"model": resolved_model, "messages": messages, "temperature": temperature}
     if max_tokens is not None:
         payload["max_tokens"] = int(max_tokens)
     t0 = time.perf_counter()
@@ -71,7 +86,7 @@ def llm_chat(
         return content
     meta: dict[str, Any] = {
         "backend": backend,
-        "model": model,
+        "model": resolved_model,
         "latency_ms": int((time.perf_counter() - t0) * 1000),
         "usage": usage_from_body(body),
     }
@@ -84,9 +99,10 @@ class _LLMClient:
         prompt: str,
         max_tokens: int | None = None,
         return_meta: bool = False,
+        model: str | None = None,
     ) -> str | tuple[str, dict[str, Any]]:
         messages = [{"role": "user", "content": prompt}]
-        return llm_chat(messages, max_tokens=max_tokens, return_meta=return_meta)
+        return llm_chat(messages, max_tokens=max_tokens, return_meta=return_meta, model=model)
 
 
 llm = _LLMClient()

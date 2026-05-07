@@ -4,6 +4,7 @@ import csv
 import json
 import os
 import sys
+import argparse
 from pathlib import Path
 
 
@@ -96,5 +97,55 @@ def load_enron(raw_dir, out_file):
                 out.write(json.dumps(doc, ensure_ascii=False) + "\n")
 
 
+def load_cuad(raw_file, out_file, split_name: str | None = None):
+    raw_path = Path(raw_file)
+    out_path = Path(out_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    root = json.loads(raw_path.read_text(encoding="utf-8"))
+    data = root.get("data", []) if isinstance(root, dict) else []
+    if not isinstance(data, list):
+        data = []
+
+    with out_path.open("w", encoding="utf-8") as out:
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title", "")).strip()
+            paragraphs = item.get("paragraphs", [])
+            if not isinstance(paragraphs, list):
+                continue
+            for p_idx, para in enumerate(paragraphs):
+                if not isinstance(para, dict):
+                    continue
+                context = str(para.get("context", "")).strip()
+                if not context:
+                    continue
+                qas = para.get("qas", [])
+                doc = {
+                    "doc_id": f"{title}#p{p_idx}",
+                    "source": "cuad",
+                    "text": context,
+                    "meta": {
+                        "title": title,
+                        "paragraph_index": p_idx,
+                        "num_qas": len(qas) if isinstance(qas, list) else 0,
+                        "split": split_name,
+                    },
+                }
+                out.write(json.dumps(doc, ensure_ascii=False) + "\n")
+
+
 if __name__ == "__main__":
-    load_enron("data/raw/enron", "data/processed/enron_docs.jsonl")
+    parser = argparse.ArgumentParser(description="Load raw dataset into docs jsonl format.")
+    parser.add_argument("--dataset", choices=["enron", "cuad"], default="enron")
+    parser.add_argument("--raw-dir", default="data/raw/enron")
+    parser.add_argument("--raw-file", default="data/raw/cuad/CUADv1.json")
+    parser.add_argument("--out-file", default="data/processed/enron_docs.jsonl")
+    parser.add_argument("--split-name", default=None)
+    args = parser.parse_args()
+
+    if args.dataset == "enron":
+        load_enron(args.raw_dir, args.out_file)
+    else:
+        load_cuad(args.raw_file, args.out_file, split_name=args.split_name)

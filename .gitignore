@@ -18,3 +18,5 @@ youtu-graphrag/
 # Editor and OS directories
 .vscode/
 .idea/
+
+.DS_Store

@@ -25,6 +25,7 @@ def run(
     sample_ratio: float | None,
     seed: int,
     min_chars: int,
+    sampling_mode: str,
 ) -> dict[str, Any]:
     if sample_size is None and sample_ratio is None:
         raise ValueError("Provide either --sample-size or --sample-ratio")
@@ -32,9 +33,12 @@ def run(
         raise ValueError("--sample-ratio must be in (0, 1]")
     if sample_size is not None and sample_size <= 0:
         raise ValueError("--sample-size must be > 0")
+    if sampling_mode not in {"random", "head"}:
+        raise ValueError("--sampling-mode must be one of: random, head")
 
     rng = random.Random(seed)
     seen_hashes: set[str] = set()
+    ratio_acc = 0.0
 
     total_count = 0
     valid_count = 0
@@ -65,15 +69,22 @@ def run(
             unique_count += 1
 
             if sample_ratio is not None:
-                if rng.random() <= sample_ratio:
-                    sampled.append(obj)
+                if sampling_mode == "random":
+                    if rng.random() <= sample_ratio:
+                        sampled.append(obj)
+                else:
+                    ratio_acc += sample_ratio
+                    if ratio_acc >= 1.0:
+                        sampled.append(obj)
+                        ratio_acc -= 1.0
                 continue
 
-            # Reservoir sampling for exact-size sample over de-duplicated stream.
+            # Sample by fixed size over de-duplicated stream.
             assert sample_size is not None
             if len(sampled) < sample_size:
                 sampled.append(obj)
-            else:
+            elif sampling_mode == "random":
+                # Reservoir sampling for exact-size random sample.
                 j = rng.randint(1, unique_count)
                 if j <= sample_size:
                     sampled[j - 1] = obj
@@ -97,6 +108,7 @@ def run(
         "sampled_docs": kept_count,
         "sample_size": sample_size,
         "sample_ratio": sample_ratio,
+        "sampling_mode": sampling_mode,
         "seed": seed,
         "min_chars": min_chars,
         "unique_keep_ratio": round(unique_keep_ratio, 6),
@@ -117,6 +129,12 @@ def main() -> None:
     mode.add_argument("--sample-ratio", type=float, help="sample ratio in (0, 1] after de-dup")
 
     parser.add_argument("--seed", type=int, default=42, help="random seed")
+    parser.add_argument(
+        "--sampling-mode",
+        choices=["random", "head"],
+        default="random",
+        help="sampling strategy: random (default) or head (deterministic)",
+    )
     parser.add_argument("--min-chars", type=int, default=20, help="minimum text length")
     parser.add_argument(
         "--stats-output",
@@ -133,6 +151,7 @@ def main() -> None:
         sample_ratio=args.sample_ratio,
         seed=args.seed,
         min_chars=args.min_chars,
+        sampling_mode=args.sampling_mode,
     )
 
     stats_path = Path(args.stats_output)

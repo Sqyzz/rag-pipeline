@@ -1,5 +1,6 @@
 import numpy as np
 import time
+import random
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
@@ -24,6 +25,40 @@ def _prepare_api_text(text: str, max_chars: int = 6000) -> str:
     if not text:
         text = "."
     return text[:max_chars]
+
+
+def _post_with_retry(
+    requests_mod,
+    url: str,
+    *,
+    json_payload: dict,
+    headers: dict,
+    timeout: int = 120,
+    max_attempts: int = 5,
+    base_sleep_sec: float = 1.0,
+):
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests_mod.post(url, json=json_payload, headers=headers, timeout=timeout)
+            if resp.status_code >= 500 and attempt < max_attempts:
+                delay = base_sleep_sec * (2 ** (attempt - 1)) + random.uniform(0.0, 0.25)
+                time.sleep(delay)
+                continue
+            return resp
+        except (
+            requests_mod.exceptions.SSLError,
+            requests_mod.exceptions.ConnectionError,
+            requests_mod.exceptions.Timeout,
+        ) as exc:
+            last_exc = exc
+            if attempt >= max_attempts:
+                raise
+            delay = base_sleep_sec * (2 ** (attempt - 1)) + random.uniform(0.0, 0.25)
+            time.sleep(delay)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Embedding request failed without a response or exception.")
 
 
 def embed_texts(texts, return_meta: bool = False):
@@ -72,13 +107,25 @@ def embed_texts(texts, return_meta: bool = False):
     ):
         batch = cleaned_texts[i : i + batch_size]
         payload = {"model": cfg.embedding.api.model, "input": batch}
-        r = requests.post(url, json=payload, headers=headers, timeout=120)
+        r = _post_with_retry(
+            requests,
+            url,
+            json_payload=payload,
+            headers=headers,
+            timeout=120,
+        )
         if not r.ok:
             # Fallback to single-item requests to isolate problematic entries.
             vectors = []
             for text in batch:
                 payload = {"model": cfg.embedding.api.model, "input": [text]}
-                rr = requests.post(url, json=payload, headers=headers, timeout=120)
+                rr = _post_with_retry(
+                    requests,
+                    url,
+                    json_payload=payload,
+                    headers=headers,
+                    timeout=120,
+                )
                 rr.raise_for_status()
                 b = rr.json()
                 usage = usage_from_body(b)

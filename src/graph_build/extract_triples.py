@@ -80,6 +80,23 @@ def _normalize_relation_text(text: str) -> str:
     return t.lower()
 
 
+def _normalize_type_text(text: str) -> str:
+    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    t = t.strip("`\"' ")
+    t = re.sub(r"[-/]+", "_", t)
+    t = re.sub(r"\s+", "_", t).strip("_")
+    return t.lower()
+
+
+def _relation_key(text: str) -> str:
+    t = _normalize_relation_text(text)
+    t = t.replace("_", " ")
+    t = re.sub(r"[^a-z0-9\s]+", " ", t)
+    t = re.sub(r"\b(a|an|the)\b", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 def _load_schema(schema_file: str | None) -> dict[str, Any] | None:
     if not schema_file:
         return None
@@ -96,22 +113,26 @@ def _compile_schema(schema: dict[str, Any] | None) -> dict[str, Any]:
     if not schema:
         return {"enabled": False}
     entity_types = {str(x).strip() for x in schema.get("entity_types", []) if str(x).strip()}
-    entity_type_alias_to_name: dict[str, str] = {t.lower(): t for t in entity_types}
+    entity_type_alias_to_name: dict[str, str] = {_normalize_type_text(t): t for t in entity_types}
     rel_rows = schema.get("relations", [])
     relation_alias_to_name: dict[str, str] = {}
     relation_constraints: dict[str, dict[str, set[str]]] = {}
+    relation_names: set[str] = set()
     for row in rel_rows:
         if not isinstance(row, dict):
             continue
         name = str(row.get("name", "")).strip()
         if not name:
             continue
-        canon = name.lower()
-        relation_alias_to_name[canon] = name
+        relation_names.add(name)
+        for candidate in (name, name.replace("_", " ")):
+            k = _relation_key(candidate)
+            if k:
+                relation_alias_to_name[k] = name
         for alias in row.get("aliases", []):
-            a = str(alias).strip().lower()
-            if a:
-                relation_alias_to_name[a] = name
+            k = _relation_key(str(alias).strip())
+            if k:
+                relation_alias_to_name[k] = name
         relation_constraints[name] = {
             "subject_types": {str(x).strip() for x in row.get("subject_types", []) if str(x).strip()},
             "object_types": {str(x).strip() for x in row.get("object_types", []) if str(x).strip()},
@@ -119,10 +140,37 @@ def _compile_schema(schema: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "enabled": True,
         "entity_types": entity_types,
+        "relation_names": relation_names,
         "entity_type_alias_to_name": entity_type_alias_to_name,
         "relation_alias_to_name": relation_alias_to_name,
         "relation_constraints": relation_constraints,
     }
+
+
+def _canonicalize_relation(
+    relation_text: str,
+    compiled_schema: dict[str, Any],
+    *,
+    strict: bool,
+) -> str | None:
+    alias_map = compiled_schema.get("relation_alias_to_name", {})
+    key = _relation_key(relation_text)
+    if not key:
+        return None
+    direct = alias_map.get(key)
+    if direct:
+        return direct
+    if strict:
+        return None
+    return key.replace(" ", "_")
+
+
+def _canonicalize_entity_type(type_text: str, compiled_schema: dict[str, Any]) -> str:
+    type_alias_map = compiled_schema.get("entity_type_alias_to_name", {})
+    key = _normalize_type_text(type_text)
+    if not key:
+        return "unknown"
+    return type_alias_map.get(key, key)
 
 
 def _schema_prompt_block(schema: dict[str, Any] | None) -> str:
@@ -145,6 +193,7 @@ def _validate_row_to_triple(
     row: dict[str, Any],
     chunk_id: str,
     compiled_schema: dict[str, Any],
+    schema_apply_mode: str = "strict",
 ) -> Triple | None:
     s = _normalize_entity_text(row.get("subject", ""))
     r_raw = _normalize_relation_text(row.get("relation", ""))
@@ -154,7 +203,11 @@ def _validate_row_to_triple(
     ot_raw = str(row.get("object_type", "")).strip()
     if not (s and r_raw and o):
         return None
-    if not compiled_schema.get("enabled"):
+    mode = str(schema_apply_mode or "strict").strip().lower()
+    if mode not in {"strict", "prompt_only", "disabled"}:
+        mode = "strict"
+
+    if mode == "disabled" or not compiled_schema.get("enabled"):
         return Triple(
             chunk_id=chunk_id,
             subject=s,
@@ -165,13 +218,29 @@ def _validate_row_to_triple(
             evidence=e,
         )
 
-    alias_map = compiled_schema["relation_alias_to_name"]
-    relation = alias_map.get(r_raw.lower())
-    if not relation:
+    relation = _canonicalize_relation(
+        r_raw,
+        compiled_schema=compiled_schema,
+        strict=(mode == "strict"),
+    )
+    if not relation and mode == "strict":
         return None
-    type_alias_map = compiled_schema["entity_type_alias_to_name"]
-    st = type_alias_map.get(st_raw.lower(), st_raw)
-    ot = type_alias_map.get(ot_raw.lower(), ot_raw)
+    if not relation:
+        relation = r_raw
+
+    st = _canonicalize_entity_type(st_raw, compiled_schema)
+    ot = _canonicalize_entity_type(ot_raw, compiled_schema)
+    if mode != "strict":
+        return Triple(
+            chunk_id=chunk_id,
+            subject=s,
+            subject_type=st,
+            relation=relation,
+            object=o,
+            object_type=ot,
+            evidence=e,
+        )
+
     entity_types = compiled_schema["entity_types"]
     if st not in entity_types or ot not in entity_types:
         return None
@@ -199,6 +268,7 @@ def _extract_with_llm(
     max_text_chars: int,
     schema: dict[str, Any] | None,
     compiled_schema: dict[str, Any],
+    schema_apply_mode: str = "strict",
 ) -> tuple[list[Triple], dict, int]:
     prompt = f"""
 Extract knowledge triples from the text below.
@@ -239,7 +309,12 @@ Text:
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            t = _validate_row_to_triple(row, chunk_id=chunk_id, compiled_schema=compiled_schema)
+            t = _validate_row_to_triple(
+                row,
+                chunk_id=chunk_id,
+                compiled_schema=compiled_schema,
+                schema_apply_mode=schema_apply_mode,
+            )
             if t is None:
                 dropped += 1
                 continue
@@ -252,6 +327,7 @@ def _extract_batch_with_llm(
     max_text_chars: int,
     schema: dict[str, Any] | None,
     compiled_schema: dict[str, Any],
+    schema_apply_mode: str = "strict",
 ) -> tuple[list[Triple], dict, int]:
     chunk_payload = [{"chunk_id": c["chunk_id"], "text": c["text"][:max_text_chars]} for c in chunks]
     prompt = f"""
@@ -297,7 +373,12 @@ Rules:
             cid = str(row.get("chunk_id", "")).strip()
             if cid not in valid_chunk_ids:
                 continue
-            t = _validate_row_to_triple(row, chunk_id=cid, compiled_schema=compiled_schema)
+            t = _validate_row_to_triple(
+                row,
+                chunk_id=cid,
+                compiled_schema=compiled_schema,
+                schema_apply_mode=schema_apply_mode,
+            )
             if t is None:
                 dropped += 1
                 continue
@@ -317,6 +398,7 @@ def extract_triples(
     max_text_chars: int = 5000,
     concurrency: int = 1,
     schema_file: str | None = "config_triple_schema.json",
+    schema_apply_mode: str = "strict",
 ) -> dict:
     telemetry = Telemetry()
     total_chunks = 0
@@ -324,15 +406,24 @@ def extract_triples(
     total_triples = 0
     parse_failures = 0
     filtered_by_schema = 0
+    recovered_from_batch_failures = 0
     llm_calls = 0
-    schema = _load_schema(schema_file)
+    relation_canonical_hits = 0
+    subject_type_schema_hits = 0
+    object_type_schema_hits = 0
+    schema_mode = str(schema_apply_mode or "strict").strip().lower()
+    if schema_mode not in {"strict", "prompt_only", "disabled"}:
+        raise ValueError("schema_apply_mode must be one of: strict, prompt_only, disabled")
+
+    schema = None if schema_mode == "disabled" else _load_schema(schema_file)
     compiled_schema = _compile_schema(schema)
 
     out_path = Path(out_file)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     _progress(
-        f"start mode={mode} chunks_file={chunks_file} schema_file={schema_file} schema_enabled={compiled_schema.get('enabled')}"
+        f"start mode={mode} chunks_file={chunks_file} schema_file={schema_file} "
+        f"schema_enabled={compiled_schema.get('enabled')} schema_apply_mode={schema_mode}"
     )
     def _iter_eligible_chunks() -> list[dict]:
         rows: list[dict] = []
@@ -365,6 +456,7 @@ def extract_triples(
                 max_text_chars=max_text_chars,
                 schema=schema,
                 compiled_schema=compiled_schema,
+                schema_apply_mode=schema_mode,
             )
             return {"ok": True, "meta": meta, "triples": triples, "chunks": 1, "dropped": dropped}
         except Exception:
@@ -380,6 +472,7 @@ def extract_triples(
                 max_text_chars=max_text_chars,
                 schema=schema,
                 compiled_schema=compiled_schema,
+                schema_apply_mode=schema_mode,
             )
             return {
                 "ok": True,
@@ -388,9 +481,39 @@ def extract_triples(
                 "chunks": len(batch_rows),
                 "chunk_doc": {x["chunk_id"]: x["doc_id"] for x in eligible},
                 "dropped": dropped,
+                "recovered": 0,
             }
         except Exception:
-            return {"ok": False, "meta": None, "triples": [], "chunks": len(batch_rows)}
+            fallback_triples: list[Triple] = []
+            fallback_meta: list[dict] = []
+            dropped_total = 0
+            fallback_failures = 0
+            for row in eligible:
+                try:
+                    triples, meta, dropped = _extract_with_llm(
+                        row["text"],
+                        chunk_id=row["chunk_id"],
+                        max_text_chars=max_text_chars,
+                        schema=schema,
+                        compiled_schema=compiled_schema,
+                        schema_apply_mode=schema_mode,
+                    )
+                    fallback_triples.extend(triples)
+                    fallback_meta.append(meta)
+                    dropped_total += dropped
+                except Exception:
+                    fallback_failures += 1
+            if fallback_failures >= len(eligible):
+                return {"ok": False, "meta": None, "triples": [], "chunks": len(batch_rows)}
+            return {
+                "ok": True,
+                "meta_list": fallback_meta,
+                "triples": fallback_triples,
+                "chunks": len(batch_rows),
+                "chunk_doc": {x["chunk_id"]: x["doc_id"] for x in eligible},
+                "dropped": dropped_total,
+                "recovered": len(eligible) - fallback_failures,
+            }
 
     rows = _iter_eligible_chunks()
     total_chunks = len(rows)
@@ -409,13 +532,24 @@ def extract_triples(
                     if not result.get("ok", True):
                         parse_failures += 1
                         continue
+                    recovered_from_batch_failures += int(result.get("recovered", 0))
                     if result.get("meta"):
                         telemetry.add_llm(result["meta"])
+                        llm_calls += 1
+                    for m in (result.get("meta_list") or []):
+                        telemetry.add_llm(m)
                         llm_calls += 1
                     filtered_by_schema += int(result.get("dropped", 0))
                     triples = result.get("triples", [])
                     chunk_doc = result.get("chunk_doc") or {}
                     for t in triples:
+                        if compiled_schema.get("enabled"):
+                            if t.relation in compiled_schema.get("relation_names", set()):
+                                relation_canonical_hits += 1
+                            if t.subject_type in compiled_schema.get("entity_types", set()):
+                                subject_type_schema_hits += 1
+                            if t.object_type in compiled_schema.get("entity_types", set()):
+                                object_type_schema_hits += 1
                         record = {
                             "chunk_id": t.chunk_id,
                             "doc_id": chunk_doc.get(t.chunk_id),
@@ -441,6 +575,13 @@ def extract_triples(
                     filtered_by_schema += int(result.get("dropped", 0))
                     triples = result.get("triples", [])
                     for t in triples:
+                        if compiled_schema.get("enabled"):
+                            if t.relation in compiled_schema.get("relation_names", set()):
+                                relation_canonical_hits += 1
+                            if t.subject_type in compiled_schema.get("entity_types", set()):
+                                subject_type_schema_hits += 1
+                            if t.object_type in compiled_schema.get("entity_types", set()):
+                                object_type_schema_hits += 1
                         record = {
                             "chunk_id": t.chunk_id,
                             "doc_id": chunk_doc.get(t.chunk_id),
@@ -464,12 +605,17 @@ def extract_triples(
         "concurrency": int(concurrency),
         "schema_file": schema_file,
         "schema_enabled": bool(compiled_schema.get("enabled")),
+        "schema_apply_mode": schema_mode,
         "total_chunks": total_chunks,
         "eligible_chunks": eligible_chunks,
         "llm_calls": llm_calls,
         "total_triples": total_triples,
         "parse_failures": parse_failures,
         "filtered_by_schema": filtered_by_schema,
+        "recovered_from_batch_failures": recovered_from_batch_failures,
+        "relation_schema_canonical_hits": relation_canonical_hits,
+        "subject_type_schema_hits": subject_type_schema_hits,
+        "object_type_schema_hits": object_type_schema_hits,
         "avg_triples_per_chunk": round(total_triples / max(total_chunks, 1), 4),
         "telemetry": telemetry.to_dict(),
     }
@@ -495,6 +641,12 @@ def main() -> None:
     parser.add_argument("--max-text-chars", type=int, default=5000)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--schema-file", default="config_triple_schema.json")
+    parser.add_argument(
+        "--schema-apply-mode",
+        choices=["strict", "prompt_only", "disabled"],
+        default="strict",
+        help="Schema application mode: strict=post-LLM hard filter, prompt_only=prompt guidance only, disabled=no schema.",
+    )
     args = parser.parse_args()
     result = extract_triples(
         args.chunks_file,
@@ -508,6 +660,7 @@ def main() -> None:
         max_text_chars=args.max_text_chars,
         concurrency=args.concurrency,
         schema_file=args.schema_file,
+        schema_apply_mode=args.schema_apply_mode,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

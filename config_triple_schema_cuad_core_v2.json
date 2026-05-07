@@ -1,0 +1,141 @@
+{
+  "entity_types": [
+    "party",
+    "agreement",
+    "clause",
+    "right",
+    "obligation",
+    "payment",
+    "date",
+    "event",
+    "law",
+    "jurisdiction",
+    "location",
+    "document",
+    "ip_right",
+    "confidential_info",
+    "license"
+  ],
+  "relations": [
+    {
+      "name": "party_to",
+      "subject_types": ["party"],
+      "object_types": ["agreement"],
+      "aliases": ["party to", "party of", "is a party to", "between"]
+    },
+    {
+      "name": "named_as",
+      "subject_types": ["agreement", "document", "clause"],
+      "object_types": ["document"],
+      "aliases": ["entitled", "titled", "document name", "known as"]
+    },
+    {
+      "name": "effective_on",
+      "subject_types": ["agreement", "clause", "document"],
+      "object_types": ["date"],
+      "aliases": ["effective date", "effective on", "commences on", "starts on"]
+    },
+    {
+      "name": "signed_on",
+      "subject_types": ["agreement", "document", "clause"],
+      "object_types": ["date"],
+      "aliases": ["dated", "executed on", "signed on", "as of"]
+    },
+    {
+      "name": "expires_on",
+      "subject_types": ["agreement", "clause"],
+      "object_types": ["date"],
+      "aliases": ["expires on", "ends on", "terminates on"]
+    },
+    {
+      "name": "renews_for",
+      "subject_types": ["agreement", "clause"],
+      "object_types": ["date"],
+      "aliases": ["renewal term", "renews for", "auto renew", "extends for"]
+    },
+    {
+      "name": "governed_by",
+      "subject_types": ["agreement", "clause"],
+      "object_types": ["law"],
+      "aliases": ["governed by", "laws of", "in accordance with the laws of"]
+    },
+    {
+      "name": "dispute_resolved_in",
+      "subject_types": ["agreement", "clause", "event"],
+      "object_types": ["jurisdiction", "location"],
+      "aliases": ["jurisdiction", "venue", "resolved in", "arbitration in", "court of"]
+    },
+    {
+      "name": "notice_to",
+      "subject_types": ["clause", "party"],
+      "object_types": ["party", "location"],
+      "aliases": ["notice to", "written notice to", "notify", "deliver notice to"]
+    },
+    {
+      "name": "grants_right_to",
+      "subject_types": ["clause", "agreement", "right"],
+      "object_types": ["party"],
+      "aliases": ["has the right to", "is entitled to", "may", "grants right to"]
+    },
+    {
+      "name": "grants_license_to",
+      "subject_types": ["party", "agreement", "license"],
+      "object_types": ["party", "ip_right"],
+      "aliases": ["grants a license", "license grant", "licensed to", "sublicense"]
+    },
+    {
+      "name": "assignable_by",
+      "subject_types": ["agreement", "license", "right", "obligation"],
+      "object_types": ["party"],
+      "aliases": ["may assign", "assignment by", "assignable by", "transfer by"]
+    },
+    {
+      "name": "terminates_on_event",
+      "subject_types": ["agreement", "clause"],
+      "object_types": ["event", "date"],
+      "aliases": ["may terminate if", "terminates upon", "termination event", "without cause"]
+    },
+    {
+      "name": "termination_fee_for",
+      "subject_types": ["payment", "clause"],
+      "object_types": ["event", "party"],
+      "aliases": ["termination fee", "liquidated damages", "early termination fee", "penalty"]
+    },
+    {
+      "name": "pays",
+      "subject_types": ["party"],
+      "object_types": ["payment", "party"],
+      "aliases": ["shall pay", "payable to", "pays", "compensates"]
+    },
+    {
+      "name": "payment_due_on",
+      "subject_types": ["payment", "obligation"],
+      "object_types": ["date", "event"],
+      "aliases": ["due on", "payable within", "payment date", "within days of"]
+    },
+    {
+      "name": "audit_right_over",
+      "subject_types": ["party", "right", "clause"],
+      "object_types": ["document", "location", "party"],
+      "aliases": ["audit rights", "inspect books and records", "examine records", "right to audit"]
+    },
+    {
+      "name": "limits_liability_of",
+      "subject_types": ["clause", "agreement"],
+      "object_types": ["party", "obligation", "payment"],
+      "aliases": ["limitation of liability", "liability cap", "maximum liability", "shall not exceed"]
+    },
+    {
+      "name": "confidentiality_applies_to",
+      "subject_types": ["clause", "agreement", "obligation"],
+      "object_types": ["confidential_info", "document", "party"],
+      "aliases": ["confidential information", "non disclosure", "keep confidential", "shall not disclose"]
+    },
+    {
+      "name": "exclusive_to",
+      "subject_types": ["agreement", "clause", "license", "right"],
+      "object_types": ["party"],
+      "aliases": ["exclusive", "sole", "exclusive right", "shall not work with third parties"]
+    }
+  ]
+}
