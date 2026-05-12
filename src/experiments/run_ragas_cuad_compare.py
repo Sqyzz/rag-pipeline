@@ -14,6 +14,7 @@ if __package__ is None or __package__ == "":
 
 from baselines.graph_rag import answer_with_graphrag
 from baselines.lightrag_adapter import answer_with_lightrag
+from baselines.vector_rag import answer_with_context, retrieve_with_evidence
 from utils.config import cfg
 from utils.ragas_converters import (
     infer_doc_prefix,
@@ -104,6 +105,76 @@ def _default_graph_cfg() -> dict[str, Any]:
     }
 
 
+def _default_vector_top_k() -> int:
+    return int(getattr(getattr(cfg, "retrieval", None), "top_k", 8))
+
+
+def _answer_with_vector_rag(
+    *,
+    query: str,
+    idx_file: str | None,
+    store_file: str | None,
+    answer_mode: str,
+    doc_prefix_filter: str | None,
+    top_k: int | None = None,
+) -> dict[str, Any]:
+    if not idx_file or not store_file:
+        raise RuntimeError(
+            "vector_rag requires --vector-idx-file and --vector-store-file. "
+            "Build them from the same ragas chunks file before compare."
+        )
+
+    effective_top_k = int(top_k or _default_vector_top_k())
+    evidence, retrieve_meta = retrieve_with_evidence(
+        query=query,
+        idx_file=idx_file,
+        store_file=store_file,
+        top_k=effective_top_k,
+        return_meta=True,
+        doc_prefix_filter=doc_prefix_filter,
+    )
+    contexts = [str(item.get("text", "") or "") for item in evidence if isinstance(item, dict)]
+    answer, answer_meta = answer_with_context(
+        query=query,
+        contexts=contexts,
+        return_meta=True,
+        answer_mode=answer_mode,
+    )
+    retrieved_context_ids = [str(item.get("chunk_id", "") or "").strip() for item in evidence if str(item.get("chunk_id", "") or "").strip()]
+    retrieved_doc_ids: list[str] = []
+    seen_doc_ids: set[str] = set()
+    for item in evidence:
+        doc_id = str(item.get("doc_id", "") or "").strip()
+        if doc_id and doc_id not in seen_doc_ids:
+            seen_doc_ids.add(doc_id)
+            retrieved_doc_ids.append(doc_id)
+
+    retrieval_trace = {
+        "orchestration_mode": "dense_vector_retrieval",
+        "top_k": effective_top_k,
+        "doc_prefix_filter": doc_prefix_filter or "",
+        "retrieved_chunk_ids": retrieved_context_ids,
+        "retrieved_doc_ids": retrieved_doc_ids,
+        "scores": [float(item.get("score", 0.0) or 0.0) for item in evidence],
+    }
+    return {
+        "answer": str(answer or "").strip(),
+        "answer_mode": _normalize_answer_mode(answer_mode),
+        "evidence_chunks": evidence,
+        "evaluation_payload": {
+            "response": str(answer or "").strip(),
+            "retrieved_contexts": contexts,
+            "retrieved_context_ids": retrieved_context_ids,
+            "retrieved_doc_ids": retrieved_doc_ids,
+        },
+        "retrieval_trace": retrieval_trace,
+        "telemetry": {
+            "embedding": (retrieve_meta or {}).get("embedding") if isinstance(retrieve_meta, dict) else {},
+            "generation": answer_meta if isinstance(answer_meta, dict) else {},
+        },
+    }
+
+
 def _run_method(
     method: str,
     question: str,
@@ -113,6 +184,8 @@ def _run_method(
     communities_file: str,
     chunks_file: str,
     lightrag_working_dir: str | None,
+    vector_idx_file: str | None,
+    vector_store_file: str | None,
     youtu_base_url: str | None,
     youtu_dataset: str | None,
     answer_mode: str,
@@ -136,6 +209,14 @@ def _run_method(
             working_dir=lightrag_working_dir,
             answer_mode=answer_mode,
             top_k=int(getattr(getattr(cfg, "retrieval", None), "top_k", 8)),
+            doc_prefix_filter=doc_prefix or None,
+        )
+    if method == "vector_rag":
+        return _answer_with_vector_rag(
+            query=scoped_question,
+            idx_file=vector_idx_file,
+            store_file=vector_store_file,
+            answer_mode=answer_mode,
             doc_prefix_filter=doc_prefix or None,
         )
     if method == "youtu_graph_rag":
@@ -298,6 +379,8 @@ def _run_single_task(
     communities_file: str,
     chunks_file: str,
     lightrag_working_dir: str | None,
+    vector_idx_file: str | None,
+    vector_store_file: str | None,
     youtu_base_url: str | None,
     youtu_dataset: str | None,
     answer_mode: str,
@@ -313,6 +396,8 @@ def _run_single_task(
         communities_file=communities_file,
         chunks_file=chunks_file,
         lightrag_working_dir=lightrag_working_dir,
+        vector_idx_file=vector_idx_file,
+        vector_store_file=vector_store_file,
         youtu_base_url=youtu_base_url,
         youtu_dataset=youtu_dataset,
         answer_mode=answer_mode,
@@ -336,6 +421,8 @@ def main() -> None:
     parser.add_argument("--graph-file", required=True)
     parser.add_argument("--communities-file", required=True)
     parser.add_argument("--lightrag-working-dir", default="")
+    parser.add_argument("--vector-idx-file", default="")
+    parser.add_argument("--vector-store-file", default="")
     parser.add_argument("--youtu-base-url", default="")
     parser.add_argument("--youtu-dataset", default="")
     parser.add_argument("--methods", default="graph_rag,lightrag,youtu_graph_rag")
@@ -384,6 +471,8 @@ def main() -> None:
         "communities_file": args.communities_file,
         "chunks_file": args.chunks_file,
         "lightrag_working_dir": (str(args.lightrag_working_dir).strip() or None),
+        "vector_idx_file": (str(args.vector_idx_file).strip() or None),
+        "vector_store_file": (str(args.vector_store_file).strip() or None),
         "youtu_base_url": (str(args.youtu_base_url).strip() or None),
         "youtu_dataset": (str(args.youtu_dataset).strip() or None),
         "answer_mode": answer_mode,

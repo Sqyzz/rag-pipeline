@@ -1,6 +1,6 @@
 # Ragas CUAD 支线操作文档
 
-本文档是可执行 runbook，用于在当前仓库里跑通一条独立的 `ragas + CUAD + graph_rag / lightrag / youtu_graph_rag` 补充评测支线。
+本文档是可执行 runbook，用于在当前仓库里跑通一条独立的 `ragas + CUAD + vector_rag / graph_rag / lightrag / youtu_graph_rag` 补充评测支线。
 
 目标分两层：
 
@@ -23,7 +23,7 @@
 
 1. 准备 sampled corpus
 2. 生成 ragas testset
-3. 三方法统一回答
+3. 多方法统一回答
 4. ragas 统一评测
 
 命名约束：
@@ -80,6 +80,8 @@ export DASHSCOPE_API_KEY=...
 - `data/processed/cuad_chunks_sampled_ragas.jsonl`
 - `outputs/graph/cuad_graph_sampled_ragas.json`
 - `outputs/graph/cuad_communities_sampled_ragas.json`
+- `outputs/indexes/faiss_cuad_sampled_ragas.idx`
+- `outputs/indexes/chunk_store_cuad_sampled_ragas.json`
 - `outputs/lightrag/cuad_sampled_ragas`
 
 如果你要跑 `youtu_graph_rag`，还需要：
@@ -191,13 +193,15 @@ python src/ingestion/sample_dedup.py \
   --stats-output outputs/results/cuad_sampled_stats_ragas.json
 ```
 
-### 3.3 基于 sampled docs 构造 chunk / graph / lightrag / youtu 资产
+### 3.3 基于 sampled docs 构造 chunk / vector / graph / lightrag / youtu 资产
 
-这一步要求三条路线都只使用 sampled corpus，并且所有资产名都带 `ragas` 后缀。
+这一步要求各条路线都只使用 sampled corpus，并且所有资产名都带 `ragas` 后缀。
 
 建议产出以下命名：
 
 - `data/processed/cuad_chunks_sampled_ragas.jsonl`
+- `outputs/indexes/faiss_cuad_sampled_ragas.idx`
+- `outputs/indexes/chunk_store_cuad_sampled_ragas.json`
 - `outputs/graph/cuad_triples_sampled_ragas.jsonl`
 - `outputs/graph/cuad_graph_sampled_ragas.json`
 - `outputs/graph/cuad_communities_sampled_ragas.json`
@@ -224,9 +228,25 @@ python src/ingestion/chunking.py \
 
 1. 这一步只负责 `docs -> chunks`
 2. 当前 `CUAD docs` 在仓库里本身是 paragraph 级，所以很多 paragraph 最终可能只产生一个 chunk，这是正常现象
-3. 这一步产出的 `cuad_chunks_sampled_ragas.jsonl` 作为后续 `ragas generate`、`graph_rag`、`lightrag`、`youtu` 的统一输入
+3. 这一步产出的 `cuad_chunks_sampled_ragas.jsonl` 作为后续 `ragas generate`、`vector_rag`、`graph_rag`、`lightrag`、`youtu` 的统一输入
 
-#### 3.3.2 再统一构造 graph / lightrag / youtu 资产
+#### 3.3.2 构造 VectorRAG 资产
+
+普通 `vector_rag` 使用同一份 sampled chunks 构建 FAISS dense index，作为 `youtu_graph_rag` 的纯向量检索对照组。
+
+```bash
+PYTHONPATH=src python -c "from pathlib import Path; import json; from baselines.vector_rag import build_index; metrics = build_index('data/processed/cuad_chunks_sampled_ragas.jsonl', 'outputs/indexes/faiss_cuad_sampled_ragas.idx', 'outputs/indexes/chunk_store_cuad_sampled_ragas.json'); Path('outputs/results/ragas').mkdir(parents=True, exist_ok=True); Path('outputs/results/ragas/vector_index_sampled_metrics_ragas.json').write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding='utf-8')"
+```
+
+输出：
+
+- `outputs/indexes/faiss_cuad_sampled_ragas.idx`
+- `outputs/indexes/chunk_store_cuad_sampled_ragas.json`
+- `outputs/results/ragas/vector_index_sampled_metrics_ragas.json`
+
+这一步只构建 dense vector index，不做图扩展、rerank 或问题拆解。
+
+#### 3.3.3 再统一构造 graph / lightrag / youtu 资产
 
 使用：
 
@@ -272,7 +292,7 @@ python src/experiments/run_compare_youtu_lightrag.py \
 2. 它不负责从 `docs` 生成 `chunks`
 3. 因此先切 chunk，再 build，是这条支线更稳定的操作顺序
 
-#### 3.3.3 可选：对比 `graph_rag` 和 `youtu` 的图结构
+#### 3.3.4 可选：对比 `graph_rag` 和 `youtu` 的图结构
 
 这一小步是可选诊断，不是 `ragas` 支线的硬前置。
 
@@ -364,7 +384,7 @@ python src/experiments/run_ragas_cuad_generate.py \
 3. `reference_contexts` 是否大量为空
 4. `reference_context_ids` 缺失率是否过高
 
-### 3.5 跑三方法统一 compare
+### 3.5 跑多方法统一 compare
 
 执行：
 
@@ -377,13 +397,17 @@ python src/experiments/run_ragas_cuad_compare.py \
   --lightrag-working-dir outputs/lightrag/cuad_sampled_ragas \
   --youtu-base-url http://127.0.0.1:8000 \
   --youtu-dataset cuad_sampled_ragas \
-  --out-file outputs/results/ragas/ragas_cuad_smoke_compare_merged_v1.jsonl \
+  --vector-idx-file outputs/indexes/faiss_cuad_sampled_ragas.idx \
+  --vector-store-file outputs/indexes/chunk_store_cuad_sampled_ragas.json \
+  --methods graph_rag,lightrag,youtu_graph_rag,vector_rag \
+  --out-file outputs/results/ragas/ragas_cuad_smoke_compare_merged.jsonl \
   --max-questions-per-type 3
 ```
 
 输出：
 
 - `outputs/results/ragas/ragas_cuad_smoke_compare_merged.jsonl`
+- `outputs/results/ragas/ragas_cuad_smoke_compare_merged_vector_rag_predictions.jsonl`
 - `outputs/results/ragas/ragas_cuad_smoke_compare_merged_graph_rag_predictions.jsonl`
 - `outputs/results/ragas/ragas_cuad_smoke_compare_merged_lightrag_predictions.jsonl`
 - `outputs/results/ragas/ragas_cuad_smoke_compare_merged_youtu_graph_rag_predictions.jsonl`
@@ -397,7 +421,9 @@ python src/experiments/run_ragas_cuad_compare.py \
   --graph-file outputs/graph/cuad_graph_sampled_ragas.json \
   --communities-file outputs/graph/cuad_communities_sampled_ragas.json \
   --lightrag-working-dir outputs/lightrag/cuad_sampled_ragas \
-  --methods graph_rag,lightrag \
+  --vector-idx-file outputs/indexes/faiss_cuad_sampled_ragas.idx \
+  --vector-store-file outputs/indexes/chunk_store_cuad_sampled_ragas.json \
+  --methods vector_rag,graph_rag,lightrag \
   --out-file outputs/results/ragas/ragas_cuad_smoke_compare_merged.jsonl \
   --max-questions-per-type 3
 ```
@@ -447,7 +473,7 @@ python src/evaluation/run_ragas_eval.py \
 满足以下条件，就可以认为冒烟通过：
 
 1. `ragas` 测试集成功生成
-2. `graph_rag` 和 `lightrag` 至少能稳定完成回答
+2. `vector_rag`、`graph_rag` 和 `lightrag` 至少能稳定完成回答
 3. 如果启用 `youtu`，它也能产出 `response` 和 `retrieved_contexts`
 4. 文本级四指标能在大多数样本上算完
 5. summary 文件能稳定导出
@@ -475,7 +501,35 @@ python src/experiments/run_ragas_cuad_generate.py \
   --random-seed 42
 ```
 
-### 5.2 跑正式 compare
+### 5.2 构建正式 VectorRAG 资产
+
+正式 compare 如果包含 `vector_rag`，必须先用本次 compare 的 `--chunks-file` 构建对应的 FAISS index 和 chunk store。
+
+下面命令只适用于正式 compare 的 `--chunks-file` 确认为 `data/processed/qa_aligned_chunks.jsonl` 的情况：
+
+```bash
+PYTHONPATH=src python -c "from pathlib import Path; import json; from baselines.vector_rag import build_index; metrics = build_index('data/processed/qa_aligned_chunks.jsonl', 'outputs/indexes/faiss_cuad_ragas.idx', 'outputs/indexes/chunk_store_cuad_ragas.json'); Path('outputs/results/ragas').mkdir(parents=True, exist_ok=True); Path('outputs/results/ragas/vector_index_metrics_ragas.json').write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding='utf-8')"
+```
+
+输出：
+
+- `outputs/indexes/faiss_cuad_ragas.idx`
+- `outputs/indexes/chunk_store_cuad_ragas.json`
+- `outputs/results/ragas/vector_index_metrics_ragas.json`
+
+如果你仍在跑小样本冒烟，不要使用这两个正式文件名，继续使用：
+
+- `outputs/indexes/faiss_cuad_sampled_ragas.idx`
+- `outputs/indexes/chunk_store_cuad_sampled_ragas.json`
+
+注意：
+
+1. `graph_rag` 使用的是 `--graph-file` 和 `--communities-file`，不是直接读取 `--chunks-file`
+2. `lightrag` 会读取 `--chunks-file`，但也会复用 `--lightrag-working-dir` 中已有资产；复用前应确认该 working dir 是从同一 chunks 文件构建的
+3. `youtu_graph_rag` 的实际检索语料来自 `--youtu-dataset` 对应的后端数据集，`--chunks-file` 主要用于本地 chunk/doc id 映射；必须确认后端数据集也是从同一语料上传的
+4. 因此 VectorRAG 的 index 必须和当前 compare 的 `--chunks-file` 同源；如果你换了 `--chunks-file`，就要换一组 `--vector-idx-file / --vector-store-file`
+
+### 5.3 跑正式 compare
 
 ```bash
 python src/experiments/run_ragas_cuad_compare.py \
@@ -486,17 +540,19 @@ python src/experiments/run_ragas_cuad_compare.py \
   --lightrag-working-dir outputs/lightrag/qa_aligned_chunks \
   --youtu-base-url http://127.0.0.1:8000 \
   --youtu-dataset cuad_v3 \
-  --out-file outputs/results/ragas/retrieval_requirements_smoke_t20-refactor_v1_tuned.jsonl \
-  --methods youtu_graph_rag \
+  --vector-idx-file outputs/indexes/faiss_cuad_ragas.idx \
+  --vector-store-file outputs/indexes/chunk_store_cuad_ragas.json \
+  --out-file outputs/results/ragas/retrieval_requirements_vector.jsonl \
+  --methods youtu_graph_rag,vector_rag \
   --max-questions-per-type 3
 ```
 
-### 5.3 跑正式 eval
+### 5.4 跑正式 eval
 
 ```bash
 python src/evaluation/run_ragas_eval.py \
-  --pred-file outputs/results/ragas/all_test.jsonl \
-  --out-dir outputs/results/ragas/all_test \
+  --pred-file outputs/results/ragas/retrieval_requirements_vector.jsonl \
+  --out-dir outputs/results/ragas/vector_test \
   --timeout-sec 300 \
   --max-workers 8
 ```
