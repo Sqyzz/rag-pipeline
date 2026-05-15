@@ -14,6 +14,7 @@ if __package__ is None or __package__ == "":
 
 from baselines.graph_rag import answer_with_graphrag
 from baselines.lightrag_adapter import answer_with_lightrag
+from baselines.ms_local_graphrag import answer_with_ms_local_graphrag
 from baselines.vector_rag import answer_with_context, retrieve_with_evidence
 from utils.config import cfg
 from utils.ragas_converters import (
@@ -202,6 +203,17 @@ def _run_method(
             strict_doc_scope=False,
             **graph_cfg,
         )
+    if method == "ms_local_graphrag":
+        return answer_with_ms_local_graphrag(
+            query=scoped_question,
+            graph_file=graph_file,
+            communities_file=communities_file,
+            chunks_file=chunks_file,
+            answer_mode=answer_mode,
+            doc_prefix_filter=doc_prefix or None,
+            strict_doc_scope=False,
+            **graph_cfg,
+        )
     if method == "lightrag":
         return answer_with_lightrag(
             query=scoped_question,
@@ -213,11 +225,11 @@ def _run_method(
         )
     if method == "vector_rag":
         return _answer_with_vector_rag(
-            query=scoped_question,
+            query=question,
             idx_file=vector_idx_file,
             store_file=vector_store_file,
             answer_mode=answer_mode,
-            doc_prefix_filter=doc_prefix or None,
+            doc_prefix_filter=None,
         )
     if method == "youtu_graph_rag":
         if not _YOUTU_AVAILABLE:
@@ -433,7 +445,9 @@ def _run_single_task(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run unified CUAD ragas compare across graph_rag/lightrag/youtu.")
+    parser = argparse.ArgumentParser(
+        description="Run unified CUAD ragas compare across graph_rag/ms_local_graphrag/lightrag/vector/youtu."
+    )
     parser.add_argument("--testset-file", required=True)
     parser.add_argument("--chunks-file", required=True)
     parser.add_argument("--graph-file", required=True)
@@ -443,7 +457,14 @@ def main() -> None:
     parser.add_argument("--vector-store-file", default="")
     parser.add_argument("--youtu-base-url", default="")
     parser.add_argument("--youtu-dataset", default="")
-    parser.add_argument("--methods", default="graph_rag,lightrag,youtu_graph_rag")
+    parser.add_argument(
+        "--methods",
+        default="graph_rag,lightrag,youtu_graph_rag",
+        help=(
+            "Comma-separated methods. vector_rag uses raw dense vector retrieval without doc-prefix "
+            "filtering; ms_local_graphrag uses a lightweight Microsoft GraphRAG Local Search-like adapter."
+        ),
+    )
     parser.add_argument("--answer-mode", default="reject")
     parser.add_argument(
         "--qid",
