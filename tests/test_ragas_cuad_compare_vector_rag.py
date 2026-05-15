@@ -55,6 +55,25 @@ from src.experiments import run_ragas_cuad_compare as compare
 
 
 class TestRagasCuadCompareVectorRag(unittest.TestCase):
+    def test_filter_questions_by_qid_supports_comma_separated_list(self) -> None:
+        rows = [
+            {"qid": "ragas-cuad-0001"},
+            {"qid": "ragas-cuad-0002"},
+            {"qid": "ragas-cuad-0003"},
+        ]
+
+        filtered = compare._filter_questions_by_qid(rows, "ragas-cuad-0003, ragas-cuad-0001")
+
+        self.assertEqual([row["qid"] for row in filtered], ["ragas-cuad-0001", "ragas-cuad-0003"])
+
+    def test_filter_questions_by_qid_raises_for_missing_qid(self) -> None:
+        rows = [{"qid": "ragas-cuad-0001"}]
+
+        with self.assertRaises(SystemExit) as cm:
+            compare._filter_questions_by_qid(rows, "ragas-cuad-9999")
+
+        self.assertIn("ragas-cuad-9999", str(cm.exception))
+
     def test_vector_rag_payload_uses_doc_scope_and_unified_output_schema(self) -> None:
         captured: dict[str, object] = {}
 

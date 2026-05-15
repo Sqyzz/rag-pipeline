@@ -368,6 +368,24 @@ def _limit_questions_per_type(rows: list[dict[str, Any]], max_per_type: int) -> 
     return kept
 
 
+def _filter_questions_by_qid(rows: list[dict[str, Any]], raw_qids: str | None) -> list[dict[str, Any]]:
+    requested = [part.strip() for part in str(raw_qids or "").split(",") if part.strip()]
+    if not requested:
+        return list(rows)
+
+    requested_set = set(requested)
+    filtered = [row for row in rows if str(row.get("qid", "")).strip() in requested_set]
+    found = {str(row.get("qid", "")).strip() for row in filtered}
+    missing = [qid for qid in requested if qid not in found]
+    if missing:
+        available_preview = [str(row.get("qid", "")).strip() for row in rows[:10]]
+        raise SystemExit(
+            "Requested qid(s) not found in testset: "
+            f"{', '.join(missing)}. Available qid preview: {available_preview}"
+        )
+    return filtered
+
+
 def _run_single_task(
     task_index: int,
     question_index: int,
@@ -428,6 +446,11 @@ def main() -> None:
     parser.add_argument("--methods", default="graph_rag,lightrag,youtu_graph_rag")
     parser.add_argument("--answer-mode", default="reject")
     parser.add_argument(
+        "--qid",
+        default="",
+        help="Comma-separated qid list to run, e.g. ragas-cuad-0002,ragas-cuad-0043. Empty runs all.",
+    )
+    parser.add_argument(
         "--max-questions-per-type",
         type=int,
         default=0,
@@ -449,6 +472,7 @@ def main() -> None:
     args = parser.parse_args()
 
     testset_rows = load_jsonl(args.testset_file)
+    testset_rows = _filter_questions_by_qid(testset_rows, args.qid)
     testset_rows = _limit_questions_per_type(testset_rows, int(args.max_questions_per_type))
     methods = [part.strip() for part in str(args.methods).split(",") if part.strip()]
     answer_mode = _normalize_answer_mode(args.answer_mode)

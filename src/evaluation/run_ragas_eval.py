@@ -38,6 +38,43 @@ def _safe_mean(values: list[Any]) -> float | None:
     return round(sum(numeric) / len(numeric), 6)
 
 
+def _safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(number):
+        return None
+    return number
+
+
+def _compute_relaxed_answer_correctness(row: dict[str, Any]) -> float | None:
+    """Evidence-aware relaxed correctness for under-specified reference answers.
+
+    RAGAS answer_correctness can over-penalize contract answers that include
+    additional grounded clauses beyond a narrow synthetic reference. Keep the
+    original metric and add a relaxed companion that rewards semantic match,
+    faithfulness, and answer relevance when those signals are strong.
+    """
+    answer_correctness = _safe_float(row.get("answer_correctness"))
+    semantic_similarity = _safe_float(row.get("semantic_similarity"))
+    faithfulness = _safe_float(row.get("faithfulness"))
+    answer_relevancy = _safe_float(row.get("answer_relevancy"))
+    components = [semantic_similarity, faithfulness, answer_relevancy]
+    if any(value is None for value in components):
+        return answer_correctness
+    relaxed = (
+        0.5 * float(semantic_similarity)
+        + 0.3 * float(faithfulness)
+        + 0.2 * float(answer_relevancy)
+    )
+    if answer_correctness is not None:
+        relaxed = max(float(answer_correctness), relaxed)
+    return round(max(0.0, min(1.0, relaxed)), 6)
+
+
 def _coverage(rows: list[dict[str, Any]], field: str) -> dict[str, Any]:
     total = len(rows)
     filled = sum(1 for row in rows if row.get(field))
@@ -496,6 +533,7 @@ def main() -> None:
             for key, value in score_row.items():
                 merged[key] = value
             merged.update(_compute_diagnostic_metrics(merged))
+            merged["relaxed_answer_correctness"] = _compute_relaxed_answer_correctness(merged)
             per_sample_rows.append(merged)
             by_method[method].append(merged)
             by_method_synth[(method, str(merged.get("synthesizer_name", "") or "unknown"))].append(merged)
@@ -511,7 +549,7 @@ def main() -> None:
 
     for method, method_rows in sorted(by_method.items()):
         row = {"group_type": "method", "method": method, "synthesizer_name": ""}
-        row.update(_summarize_group(method_rows, metric_names + diagnostic_metric_names))
+        row.update(_summarize_group(method_rows, metric_names + ["relaxed_answer_correctness"] + diagnostic_metric_names))
         method_summary_rows.append(row)
 
     for (method, synthesizer_name), synth_rows in sorted(by_method_synth.items()):
@@ -520,13 +558,14 @@ def main() -> None:
             "method": method,
             "synthesizer_name": synthesizer_name,
         }
-        row.update(_summarize_group(synth_rows, metric_names + diagnostic_metric_names))
+        row.update(_summarize_group(synth_rows, metric_names + ["relaxed_answer_correctness"] + diagnostic_metric_names))
         method_synth_rows.append(row)
 
     summary_payload = {
         "pred_file": str(Path(args.pred_file).resolve()),
         "out_dir": str(out_dir.resolve()),
         "metrics": metric_names,
+        "relaxed_metrics": ["relaxed_answer_correctness"],
         "diagnostic_metrics": diagnostic_metric_names,
         "enable_id_based": bool(args.enable_id_based),
         "enable_factual_correctness": bool(args.enable_factual_correctness),

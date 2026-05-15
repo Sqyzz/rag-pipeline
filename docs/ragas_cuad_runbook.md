@@ -543,7 +543,7 @@ python src/experiments/run_ragas_cuad_compare.py \
   --vector-idx-file outputs/indexes/faiss_cuad_ragas.idx \
   --vector-store-file outputs/indexes/chunk_store_cuad_ragas.json \
   --out-file outputs/results/ragas/retrieval_requirements_vector.jsonl \
-  --methods youtu_graph_rag,vector_rag \
+  --methods youtu_graph_rag \
   --max-questions-per-type 3
 ```
 
