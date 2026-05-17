@@ -542,18 +542,17 @@ python src/experiments/run_ragas_cuad_compare.py \
   --youtu-dataset cuad_v3 \
   --vector-idx-file outputs/indexes/faiss_cuad_ragas.idx \
   --vector-store-file outputs/indexes/chunk_store_cuad_ragas.json \
-  --out-file outputs/results/ragas/retrieval_requirements_vector.jsonl \
-  --methods youtu_graph_rag,vector_rag \
-  --max-workers 8 \
-  --max-questions-per-type 3
+  --out-file outputs/results/ragas/retrieval_requirements_prued_graph.jsonl \
+  --methods ms_local_graphrag \
+  --max-workers 8 
 ```
 
 ### 5.4 跑正式 eval
 
 ```bash
 python src/evaluation/run_ragas_eval.py \
-  --pred-file outputs/results/ragas/retrieval_requirements_vector.jsonl \
-  --out-dir outputs/results/ragas/vector_test \
+  --pred-file outputs/results/ragas/retrieval_requirements_ms_local_noscope.jsonl \
+  --out-dir outputs/results/ragas/ms_local_noscope \
   --timeout-sec 300 \
   --max-workers 8
 ```

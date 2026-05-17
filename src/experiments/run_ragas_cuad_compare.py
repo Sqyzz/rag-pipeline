@@ -205,12 +205,12 @@ def _run_method(
         )
     if method == "ms_local_graphrag":
         return answer_with_ms_local_graphrag(
-            query=scoped_question,
+            query=question,
             graph_file=graph_file,
             communities_file=communities_file,
             chunks_file=chunks_file,
             answer_mode=answer_mode,
-            doc_prefix_filter=doc_prefix or None,
+            doc_prefix_filter=None,
             strict_doc_scope=False,
             **graph_cfg,
         )
@@ -462,7 +462,8 @@ def main() -> None:
         default="graph_rag,lightrag,youtu_graph_rag",
         help=(
             "Comma-separated methods. vector_rag uses raw dense vector retrieval without doc-prefix "
-            "filtering; ms_local_graphrag uses a lightweight Microsoft GraphRAG Local Search-like adapter."
+            "filtering; ms_local_graphrag uses a lightweight Microsoft GraphRAG Local Search-like adapter "
+            "without reference-derived document scoping."
         ),
     )
     parser.add_argument("--answer-mode", default="reject")
