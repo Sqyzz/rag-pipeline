@@ -228,14 +228,15 @@ def contents_slide(prs: Presentation):
         ("03", "方法设计", "四层图结构与Agentic Decomposer联动"),
         ("04", "实验验证", "数据集构建与关键结果"),
         ("05", "结论展望", "适用场景与后续方向"),
+        ("06", "盲审回应", "修改重点与专家意见回应"),
     ]
-    y = 2.0
+    y = 1.95
     for no, title, desc in sections:
         add_text(slide, no, 1.0, y + 0.04, 0.7, 0.34, font_size=17, color="gold", bold=True)
         add_text(slide, title, 1.85, y, 1.8, 0.36, font_size=16, color="deep_teal", bold=True)
         add_text(slide, desc, 3.35, y + 0.03, 6.8, 0.34, font_size=13, color="ink")
         add_line(slide, 1.0, y + 0.56, 10.8, y + 0.56, color="line")
-        y += 0.85
+        y += 0.72
     add_box(slide, "主线：企业知识天然分层 → 图谱分层组织 → Query规划路由 → 多粒度证据召回", 1.0, 6.35, 10.9, 0.5, font_size=14, color="white", bold=True, align=PP_ALIGN.CENTER, valign=MSO_ANCHOR.MIDDLE, fill="deep_teal", radius=MSO_SHAPE.ROUNDED_RECTANGLE)
     add_footer(slide)
     return slide
@@ -513,11 +514,72 @@ def conclusion_slide(prs: Presentation):
     return slide
 
 
+def review_response_slide(prs: Presentation):
+    slide = prs.slides.add_slide(prs.slide_layouts[0])
+    set_bg(slide, "bg")
+    add_header(slide, prs, "盲审专家意见回应", 12)
+    add_text(slide, "根据盲审意见，本次修改主要围绕理论规范、系统设计和实验数据三方面展开。", 0.75, 1.05, 10.8, 0.34, font_size=14, color="muted")
+
+    cards = [
+        (
+            "01",
+            "理论与规范",
+            [
+                "增设企业知识库与检索知识库的核心概念界定",
+                "补充近两年国外前沿文献，完善研究基础",
+                "规范提炼四项学术研究方法，优化技术路线图与引用格式",
+            ],
+        ),
+        (
+            "02",
+            "系统设计与约束",
+            [
+                "进一步说明关键参数的业务选取原则",
+                "补充创新变量的理论依据",
+                "强化需求建模、框架设计与实证验证之间的对应关系",
+            ],
+        ),
+        (
+            "03",
+            "实验与数据",
+            [
+                "新增 VectorRAG 作为基础对照组",
+                "固化文本切片、模型调用等微观实验参数",
+                "结果显示：仅损失约5%冗余召回，检索精准度提升22%以上",
+            ],
+        ),
+    ]
+
+    x = 0.62
+    for no, title, items in cards:
+        add_box(slide, no, x, 1.62, 0.72, 0.46, font_size=15, color="white", bold=True, align=PP_ALIGN.CENTER, valign=MSO_ANCHOR.MIDDLE, fill="gold", radius=MSO_SHAPE.ROUNDED_RECTANGLE, margin=0.02)
+        add_box(slide, title, x + 0.84, 1.62, 2.75, 0.46, font_size=15, color="white", bold=True, align=PP_ALIGN.CENTER, valign=MSO_ANCHOR.MIDDLE, fill="deep_teal", radius=MSO_SHAPE.ROUNDED_RECTANGLE, margin=0.02)
+        add_box(slide, "", x, 2.24, 3.6, 2.35, fill="white", line="line", radius=MSO_SHAPE.ROUNDED_RECTANGLE)
+        add_bullets(slide, items, x + 0.18, 2.42, 3.25, 1.82, font_size=10, gap_after=5)
+        x += 4.1
+
+    add_box(
+        slide,
+        "修改主线：先补足概念与文献基础，再明确方法设计约束，最后通过新增基线和参数固化回应实验有效性问题。",
+        0.92,
+        5.52,
+        11.45,
+        0.72,
+        font_size=14,
+        color="white",
+        bold=True,
+        align=PP_ALIGN.CENTER,
+        valign=MSO_ANCHOR.MIDDLE,
+        fill="teal",
+        radius=MSO_SHAPE.ROUNDED_RECTANGLE,
+    )
+    add_footer(slide)
+    return slide
+
+
 def ending_slide(prs: Presentation):
     slide = prs.slides.add_slide(prs.slide_layouts[0])
     set_bg(slide, "deep_teal")
-    add_box(slide, "", 0.62, 0.42, 2.45, 0.8, fill="white", radius=MSO_SHAPE.ROUNDED_RECTANGLE)
-    add_logo(slide, prs, 0.76, 0.52, 2.1)
     add_text(slide, "汇报完毕，感谢聆听", 2.55, 2.35, 8.3, 0.72, font_size=32, color="white", bold=True, align=PP_ALIGN.CENTER, font=FONT_SERIF)
     add_line(slide, 4.1, 3.35, 9.25, 3.35, color="gold", width=2.2)
     add_text(slide, "敬请各位老师批评指正", 3.7, 3.72, 5.9, 0.42, font_size=18, color="white", align=PP_ALIGN.CENTER)
@@ -540,6 +602,7 @@ def build() -> None:
     dataset_slide(prs)
     results_slide(prs)
     conclusion_slide(prs)
+    review_response_slide(prs)
     ending_slide(prs)
 
     prs.save(OUT)
